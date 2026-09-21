@@ -1,0 +1,18 @@
+[project]
+name = "paper-organizer"
+version = "1.0.0"
+description = "Build a tidy, BibTeX-indexed repository from a pile of unsorted mathematical PDFs"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.25"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+paper-organizer = "paperorg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["paperorg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
