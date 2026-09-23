@@ -33,6 +33,7 @@ class Item:
     note: str = ""
     placement: object | None = None
     duplicates: list[Path] = field(default_factory=list)   # byte-identical twins
+    lookup_failed: list[str] = field(default_factory=list) # hosts that did not answer
 
     @property
     def path(self) -> Path:

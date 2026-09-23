@@ -12,7 +12,8 @@ BIB_NAME = "library.bib"
 
 PDF_EXTS = {".pdf"}
 DJVU_EXTS = {".djvu", ".djv"}
-OTHER_DOC_EXTS = {".ps", ".dvi"}
+PS_EXTS = {".ps"}
+OTHER_DOC_EXTS = {".dvi"}
 
 
 @dataclass
@@ -27,8 +28,11 @@ class Config:
     ocr_dpi: int = 300
     ocr_timeout: int = 120
     djvu: bool = True
+    ps: bool = True                     # convert PostScript with ps2pdf
+    ps_timeout: int = 180
     online: bool = True
     zbmath: bool = True
+    mathnet: bool = True
     # Matching thresholds.
     accept_score: float = 0.86          # auto-accept a metadata match
     review_score: float = 0.70          # below accept: ask the user (if interactive)
@@ -40,6 +44,7 @@ class Config:
     retries: int = 3
     # Behaviour when running without a human.
     default_unknown_action: str = "unsorted"   # unsorted | ignore
+    on_rate_limit: str = "stop"                # stop (and resume later) | skip
     link_mode: str = "symlink"                  # symlink | copy | none
     cache_path: Path | None = None
     limit: int | None = None

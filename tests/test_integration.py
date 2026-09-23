@@ -23,8 +23,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def make_pdf(path: Path, title: str, authors: str, body: str = "", pages: int = 1) -> Path:
-    """Render a minimal but genuine PDF with a title page."""
+def make_ps(path: Path, title: str, authors: str, body: str = "", pages: int = 1) -> Path:
+    """Write a minimal PostScript document with a title page."""
     def esc(s):
         return s.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
@@ -44,8 +44,13 @@ def make_pdf(path: Path, title: str, authors: str, body: str = "", pages: int = 
                    f"72 700 moveto (page {pg + 1}) show"]
         ps.append("showpage")
     path.parent.mkdir(parents=True, exist_ok=True)
-    src = path.with_suffix(".ps")
-    src.write_text("\n".join(ps))
+    path.write_text("\n".join(ps))
+    return path
+
+
+def make_pdf(path: Path, title: str, authors: str, body: str = "", pages: int = 1) -> Path:
+    """Render a minimal but genuine PDF with a title page."""
+    src = make_ps(path.with_suffix(".ps"), title, authors, body, pages)
     subprocess.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
                     f"-sOutputFile={path}", str(src)], check=True,
                    capture_output=True)
@@ -242,3 +247,152 @@ def test_cached_features_round_trip_with_their_text(tmp_path):
     assert restored.text, "the cached record must keep its text"
     from paperorg.classify import classify
     assert classify(restored)[0] is classify(fresh)[0]
+
+
+@pytest.mark.skipif(not shutil.which("ps2pdf"), reason="needs ps2pdf")
+def test_postscript_is_converted_and_the_pdf_is_placed(tmp_path):
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    make_ps(inp / "A. Suslin - Projective modules over polynomial rings.ps",
+            "Projective modules over polynomial rings", "Andrei Suslin", pages=6)
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, online=False,
+                 ocr=False, jobs=2)
+    stats = Organizer(cfg).run()
+    assert stats["placed"] == 1
+    placed = out / "Suslin, Andrei" / "Projective modules over polynomial rings.pdf"
+    assert placed.is_file()
+    assert placed.read_bytes().startswith(b"%PDF")
+    assert not list(out.rglob("*.ps"))
+    assert str(placed.relative_to(out)) in cfg.bib_path.read_text(encoding="utf-8")
+
+    # A resumed run recognises the converted PDF already in place.
+    again = Organizer(cfg).run()
+    assert again["reused"] == again["placed"] == 1
+    assert not list(out.rglob("* (2).pdf"))
+
+
+def test_postscript_is_skipped_when_disabled(tmp_path):
+    inp = tmp_path / "in"
+    make_ps(inp / "A. Suslin - Projective modules.ps", "Projective modules",
+            "Andrei Suslin")
+    cfg = Config(input_dir=inp, output_dir=tmp_path / "repo", interactive=False,
+                 online=False, ocr=False, ps=False)
+    org = Organizer(cfg)
+    assert org.scan() == [] and org.skipped_files == 1
+
+
+def test_text_report_lists_what_was_not_filed_normally(tmp_path):
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    make_pdf(inp / "A. Suslin - Projective modules over polynomial rings.pdf",
+             "Projective modules over polynomial rings", "Andrei Suslin", pages=6)
+    shutil.copy2(inp / "A. Suslin - Projective modules over polynomial rings.pdf",
+                 inp / "copy.pdf")
+    make_pdf(inp / "SEPA_Lastschriftmandat.pdf", "SEPA Lastschriftmandat",
+             "Bank", "Gläubiger-Identifikationsnummer")
+    (inp / "notes").mkdir()
+    (inp / "notes" / "draft.tex").write_text("\\documentclass{article}")
+    (inp / "broken.pdf").write_bytes(b"%PDF-1.4\ngarbage")
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, online=False,
+                 ocr=False, jobs=2)
+    Organizer(cfg).run()
+
+    report = (cfg.state_dir / "report.txt").read_text(encoding="utf-8")
+    sections = dict(re.findall(r"== (.+?) \([^)]*\) ==\n(.*?)(?=\n\n\n==|\Z)",
+                               report, re.S))
+    assert "notes/draft.tex" in sections["Not a document"]
+    assert "SEPA_Lastschriftmandat.pdf" in sections["Not recognised"]
+    assert "-> Unsorted/" in sections["Not recognised"]
+    assert "copy.pdf" in sections["Duplicates"]
+    assert "broken.pdf" in sections["Not recognised"]
+    # Offline, nothing can come from a registry.
+    assert "-> Suslin, Andrei/" in sections["No registry match"]
+
+
+def test_text_report_is_written_when_nothing_is_a_document(tmp_path):
+    inp = tmp_path / "in"
+    inp.mkdir()
+    (inp / "slides.ppt").write_bytes(b"not a pdf")
+    cfg = Config(input_dir=inp, output_dir=tmp_path / "repo", interactive=False,
+                 online=False, ocr=False)
+    assert Organizer(cfg).run() == {"found": 0}
+    assert "slides.ppt" in (cfg.state_dir / "report.txt").read_text(encoding="utf-8")
+
+
+def test_macos_resource_forks_are_not_documents(tmp_path):
+    inp = tmp_path / "in"
+    make_pdf(inp / "A. Suslin - Projective modules.pdf", "Projective modules",
+             "Andrei Suslin")
+    (inp / "._A. Suslin - Projective modules.pdf").write_bytes(b"\x00\x05\x16\x07" + b"\0" * 60)
+    cfg = Config(input_dir=inp, output_dir=tmp_path / "repo", interactive=False,
+                 online=False, ocr=False)
+    org = Organizer(cfg)
+    assert [p.name for p in org.scan()] == ["A. Suslin - Projective modules.pdf"]
+    assert org.skipped_files == 1
+
+
+@pytest.mark.skipif(not shutil.which("ps2pdf"), reason="needs ps2pdf")
+def test_gzipped_postscript_and_pdf_are_unpacked_and_placed(tmp_path):
+    import gzip
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    ps = make_ps(tmp_path / "src.ps", "Projective modules over polynomial rings",
+                 "Andrei Suslin", pages=3)
+    (inp / "sub").mkdir(parents=True)
+    (inp / "A. Suslin - Projective modules over polynomial rings.ps.gz") \
+        .write_bytes(gzip.compress(ps.read_bytes()))
+    pdf = make_pdf(tmp_path / "src.pdf", "Stability in algebraic K-theory",
+                   "Leonid Vaserstein", pages=3)
+    # no ".pdf" before ".gz": found by looking inside
+    (inp / "sub" / "L. Vaserstein - Stability in algebraic K-theory.gz") \
+        .write_bytes(gzip.compress(pdf.read_bytes()))
+    (inp / "notes.tex.gz").write_bytes(gzip.compress(b"\\documentclass{article}"))
+
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, online=False,
+                 ocr=False, jobs=2)
+    stats = Organizer(cfg).run()
+    assert stats["found"] == 2 and stats["placed"] == 2
+    for p in (out / "Suslin, Andrei" / "Projective modules over polynomial rings.pdf",
+              out / "Vaserstein, Leonid" / "Stability in algebraic K-theory.pdf"):
+        assert p.read_bytes().startswith(b"%PDF"), p
+    assert not list(out.rglob("*.gz"))
+    assert "notes.tex.gz" in (cfg.state_dir / "report.txt").read_text(encoding="utf-8")
+
+
+def test_a_rate_limited_run_stops_and_resumes(tmp_path, monkeypatch):
+    """When a registry starts refusing, stop before any prompt or copy, say
+    how to continue, and let the same command pick the run up again."""
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    make_pdf(inp / "A. Suslin - Projective modules over polynomial rings.pdf",
+             "Projective modules over polynomial rings", "Andrei Suslin")
+    make_pdf(inp / "L. Vaserstein - Stability in algebraic K-theory.pdf",
+             "Stability in algebraic K-theory", "Leonid Vaserstein")
+    from paperorg import sources
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, ocr=False,
+                 jobs=1, crossref_workers=1, retries=3)
+
+    org = Organizer(cfg)
+    org.http.fetch = lambda url, accept, form=None: (429, "")
+    stats = org.run()
+    assert "api.crossref.org" in stats["interrupted"]
+    resume = (cfg.state_dir / "RESUME.txt").read_text(encoding="utf-8")
+    assert "api.crossref.org" in resume and "--on-rate-limit skip" in resume
+    assert not cfg.bib_path.exists() and not list(out.rglob("*.pdf"))
+
+    again = Organizer(cfg)                  # the block has lifted
+    again.http.fetch = lambda url, accept, form=None: (404, "")
+    assert again.run()["placed"] == 2       # no "output exists" question either
+    assert not (cfg.state_dir / "RESUME.txt").exists()
+
+
+def test_skip_mode_finishes_without_the_refusing_registry(tmp_path, monkeypatch):
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    make_pdf(inp / "A. Suslin - Projective modules over polynomial rings.pdf",
+             "Projective modules over polynomial rings", "Andrei Suslin")
+    from paperorg import sources
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, ocr=False,
+                 retries=3, on_rate_limit="skip")
+    org = Organizer(cfg)
+    org.http.fetch = lambda url, accept, form=None: (429, "")
+    assert org.run()["placed"] == 1
+    assert "lookup incomplete: api.crossref.org" in \
+        (cfg.state_dir / "report.txt").read_text(encoding="utf-8")

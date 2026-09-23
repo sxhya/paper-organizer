@@ -993,3 +993,146 @@ def test_extract_school_prefers_the_university_over_the_institute():
 ])
 def test_role_prefixes_are_stripped_from_registry_names(raw, folder):
     assert _split_name(raw).folder == folder
+
+
+def test_is_cyrillic():
+    from paperorg.util import is_cyrillic
+    assert is_cyrillic("А. Суслин - О структуре специальной линейной группы.pdf")
+    assert not is_cyrillic("A. Suslin - On the structure of the special linear group.pdf")
+    assert not is_cyrillic("")
+
+
+@pytest.mark.parametrize("meta", ["thesis.dvi", "Microsoft Word - talk.doc", "main.tex"])
+def test_a_file_name_in_the_title_field_is_not_a_title(meta):
+    from paperorg.record import DocFeatures
+    f = DocFeatures(path=Path("thesis.ps"), meta_title=meta)
+    assert meta not in f.title_candidates()
+
+
+@pytest.mark.parametrize("name, stem", [
+    ("A. Suslin - Title.ps.gz", "A. Suslin - Title"),
+    ("B. Kahn - Approaches to SK_1 of CSA.gz", "B. Kahn - Approaches to SK_1 of CSA"),
+    ("Subgroups containing a torus. II.ps.gz", "Subgroups containing a torus. II"),
+])
+def test_name_stem_strips_gz(name, stem):
+    from paperorg.extract import name_stem
+    assert name_stem(Path(name)) == stem
+
+
+def test_a_definite_not_found_is_cached(tmp_path):
+    """zbMATH answers "no hits" with 404; asking again on every run is waste."""
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    calls = {"n": 0}
+
+    def missing(url, accept):
+        calls["n"] += 1
+        return (404, "")
+
+    http.fetch = missing
+    assert http.get("https://example.org/z") is None
+    assert http.get("https://example.org/z") is None
+    assert calls["n"] == 1
+
+
+def test_a_rate_limiting_host_is_left_alone_for_the_rest_of_the_run(tmp_path, monkeypatch):
+    from paperorg import sources
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out", retries=3)
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    calls = {"n": 0}
+
+    def limited(url, accept):
+        calls["n"] += 1
+        return (429, "")
+
+    http.fetch = limited
+    http.begin_item()
+    assert http.get("https://export.arxiv.org/api/query?q=1") is None
+    assert http.failed_hosts() == {"export.arxiv.org"}
+    assert "export.arxiv.org" in http.blocked
+    before = calls["n"]
+    http.begin_item()
+    assert http.get("https://export.arxiv.org/api/query?q=2") is None
+    assert calls["n"] == before, "a blocked host must not be asked again"
+    assert http.failed_hosts() == {"export.arxiv.org"}
+
+
+def test_a_definite_answer_is_not_a_failed_lookup(tmp_path):
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    http.fetch = lambda url, accept: (404, "")
+    http.begin_item()
+    http.get("https://api.zbmath.org/x")
+    assert http.failed_hosts() == set()
+
+
+# --------------------------------------------------------------- Math-Net.Ru
+
+_MN_RESULTS = """<span class=red><b>Найдено публикаций: 1</b></span><table>
+<tr><td valign=top>1.</td><td valign=top align=left>
+<a class=SLink href="/rus/aa1249">Геометрия корневых элементов в&nbsp;группах типа&nbsp;<nobr>$\\mathrm E_6$</nobr></a><br>И.&nbsp;М.&nbsp;Певзнер<br><i>Алгебра и анализ</i>, 2011<nobr><b>, 23</b>:3</nobr>, &nbsp;<nobr>261&ndash;309</nobr>
+</td></tr></table>"""
+
+_MN_RUS = """<a href='https://doi.org/10.1090/S1061-0022-2012-01210-0'>badge</a>
+<a href='https://doi.org/10.4213/aa1249'>DOI</a>
+<a href='https://mathscinet.ams.org/mathscinet-getitem?mr=2896171'></a>
+<a href='https://zbmath.org/?q=an:1285.20048'></a>
+<div class='msc'><b>MSC:</b> Primary <a href='https://mathscinet.ams.org/mathscinet/freetools/msc-search?text=20G41'>20G41</a>;
+Secondary <a href='https://mathscinet.ams.org/mathscinet/freetools/msc-search?text=17B22'>17B22</a></div>
+<b>Английская версия:</b> <i>St. Petersburg Math. J.</i>
+DOI: <a href='https://doi.org/10.1090/S1061-0022-2012-01210-0'>x</a>"""
+
+_MN_ENG = """<title>I.&nbsp;M.&nbsp;Pevzner, &#x201C;The geometry of root elements in groups of type
+$\\mathrm E_6$&#x201D;, Algebra i Analiz, 23:3 (2011), 261&ndash;309; St. Petersburg Math. J.,
+23:3 (2012), 603&ndash;635</title>"""
+
+
+def test_mathnet_search_rows_are_parsed():
+    from paperorg.sources import parse_mathnet_results
+    [rec] = parse_mathnet_results(_MN_RESULTS)
+    assert rec.title == "Геометрия корневых элементов в группах типа $\\mathrm E_6$"
+    assert [(a.given, a.family) for a in rec.authors] == [("И. М.", "Певзнер")]
+    assert (rec.journal, rec.year, rec.volume, rec.number, rec.pages) == \
+        ("Алгебра и анализ", "2011", "23", "3", "261--309")
+    assert rec.url.endswith("/rus/aa1249") and rec.language == "russian"
+
+
+def test_mathnet_pages_give_ids_msc_latin_names_and_the_translation():
+    from paperorg.sources import apply_mathnet_pages, parse_mathnet_results
+    [rec] = parse_mathnet_results(_MN_RESULTS)
+    translation = apply_mathnet_pages(rec, _MN_RUS, _MN_ENG)
+    assert rec.doi == "10.4213/aa1249", "the original's DOI, not the translation's"
+    assert translation == "10.1090/S1061-0022-2012-01210-0"
+    assert (rec.mrnumber, rec.zbl, rec.msc) == ("2896171", "1285.20048", ["20G41", "17B22"])
+    assert [a.family for a in rec.authors] == ["Pevzner"]
+    assert rec.bib_note.startswith("English translation: “The geometry of root elements")
+    assert "St. Petersburg Math. J., 23:3 (2012), 603–635" in rec.bib_note
+    assert "Algebra i Analiz" not in rec.bib_note
+
+
+def test_transliterated_names_agree():
+    from paperorg.match import author_agreement
+    from paperorg.record import Author, BibRecord
+    rec = BibRecord(authors=[Author(given="Н. А.", family="Вавилов"),
+                             Author(given="В. А.", family="Петров")])
+    assert author_agreement(rec, "N. Vavilov, V. Petrov") == 1.0
+    assert author_agreement(rec, "A. Suslin") == 0.0
+
+
+def test_msc_goes_to_mrclass_and_keywords():
+    from paperorg.record import BibRecord
+    rec = BibRecord(kind=DocKind.PAPER, title="T", year="2000", journal="J",
+                    msc=["20G35", "14L15", "13D15"])
+    text = bibtex.format_entry(rec, "k", "")
+    assert re.search(r"mrclass\s*= \{20G35 \(14L15 13D15\)\}", text)
+    assert "MSC: 20G35, 14L15, 13D15" in text

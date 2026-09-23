@@ -198,8 +198,12 @@ def _fields_for(rec: BibRecord, file_rel: str | None) -> list[tuple[str, str]]:
         add(("isbn", rec.isbn))
     add(("url", rec.url))
     if rec.msc:
+        # MathSciNet's form, "20G35 (14L15 13D15)": primary, then secondary.
+        rest = f" ({' '.join(rec.msc[1:])})" if rec.msc[1:] else ""
+        add(("mrclass", rec.msc[0] + rest))
         add(("keywords", "MSC: " + ", ".join(rec.msc)))
     add(("language", rec.language))
+    add(("note", escape(rec.bib_note)))
     if file_rel:
         # JabRef "file" field: description:path:type
         add(("file", f":{_jabref_escape(file_rel)}:PDF"))

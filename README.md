@@ -25,6 +25,7 @@ input/                                 NEW_REPO/
 ```bash
 sudo apt install poppler-utils                 # required
 sudo apt install tesseract-ocr djvulibre-bin   # optional: scans and DjVu
+sudo apt install ghostscript                   # optional: PostScript (ps2pdf)
 pip install requests                           # optional: faster HTTP than urllib
 
 ./organize.py input/ library/ --sample 50 -n   # dry run on 50 random files
@@ -33,7 +34,7 @@ pip install requests                           # optional: faster HTTP than urll
 
 Nothing but `poppler-utils` is mandatory, and the only Python dependency is
 `requests` (it falls back to `urllib` if absent). A dry run writes no
-documents — only `library/.paperorg/report.csv`, the plan, one row per file.
+documents — only the plan in `library/.paperorg/` (`report.txt` and `report.csv`).
 
 ## How a document is identified
 
@@ -60,12 +61,41 @@ automatically, anything between that and 0.70 is offered to you, and the rest
 falls through to step 5.
 
 Metadata sources: **Crossref** (DOI, journal, volume, pages), **arXiv**
-(preprints), **zbMATH** (Zbl number, MSC codes), **OpenLibrary** (books).
+(preprints), **zbMATH** (Zbl number, MSC codes), **OpenLibrary** (books),
+**Math-Net.Ru** (Russian journals, for Cyrillic titles).
 
 > **MR numbers.** MathSciNet has no free API, so `mrnumber` is filled only when
-> the number is printed in the document itself or appears in Crossref's
-> `alternative-id`. zbMATH's `zbl` field and MSC codes are always attempted and
-> serve the same purpose for most workflows.
+> the number is printed in the document itself, appears in Crossref's
+> `alternative-id`, or is linked from the Math-Net.Ru page. zbMATH's `zbl` field
+> and MSC codes are always attempted and serve the same purpose for most
+> workflows.
+
+MSC codes go into each entry twice: `mrclass = {20G35 (14L15 13D15)}` in
+MathSciNet's form (primary, then secondary), which JabRef and biblatex styles
+can sort and filter on, and `keywords = {MSC: 20G35, 14L15, 13D15}`.
+
+### Russian-language papers
+
+Crossref and arXiv hold at best the English *translation* of a Russian paper,
+under a title the file does not contain. A document whose title is in Cyrillic
+is therefore looked up on [Math-Net.Ru](https://www.mathnet.ru) first, the
+Steklov Institute's index of the Russian journals (Izvestiya, Algebra i Analiz,
+Zapiski POMI/LOMI, Uspekhi, ...). There is no API: the search form and the
+paper pages are parsed, one request per second, all cached. A match gives
+
+* the entry for the **Russian original** (the file is the original): Cyrillic
+  title and journal, volume, pages, `language = {russian}`, `doi` only when the
+  original has one (Math-Net.Ru's own `10.4213/...`);
+* author names in their **Latin** spelling from the English page, so that
+  `Н. А. Вавилов` lands in the same folder as `N. A. Vavilov`;
+* MR number, Zbl id, MSC codes (from zbMATH through the translation's DOI when
+  Math-Net.Ru lists none);
+* `note = {English translation: “...”, St. Petersburg Math. J., 23:3 (2012),
+  603–635, doi:...}`.
+
+Conference volumes, preprints and books are mostly not on Math-Net.Ru, and a
+file name that is a transliteration (`Avtomorfizmy linejnyh grupp...`) is not
+turned back into Cyrillic. `--no-mathnet` switches it off.
 
 ## Measured on the real corpus
 
@@ -120,7 +150,16 @@ Things the sample corpus actually contained, and what happens to them:
 * **PDFs whose name lost its extension** (`...root systemspdf`, or no extension
   at all) — detected by their `%PDF` header and filed normally; 8 of them here.
   The name is also parsed without letting `Path.stem` cut at the wrong dot.
-* **Non-documents** (`.ps`, `.dvi`, `.tex`, `.ppt`) — counted and reported, never
+* **PostScript** (`.ps`, or a `%!PS` header under any name) — converted with
+  `ps2pdf` into `NEW_REPO/.paperorg/converted/`, read like any other PDF, and
+  the PDF is what lands in the repository. `--no-ps` skips them instead.
+* **Gzipped documents** (`.ps.gz`, `.pdf.gz`, `.djvu.gz`, or a bare `.gz`
+  whose content is one of these) — unpacked into the same folder (and
+  PostScript then converted), so the repository gets a plain PDF or DjVu. A
+  gzipped `.tex` or anything else is listed as not a document.
+* **macOS resource forks** (`._Name.pdf`) — not copies of `Name.pdf`; listed
+  as not documents.
+* **Non-documents** (`.dvi`, `.tex`, `.ppt`) — listed in `report.txt`, never
   silently dropped.
 * **ALL-CAPS titles and names** from OCR and older journals — restored to normal
   case (`YOU'AN CAO` → `Cao, You'an`, keeping `O'Neill` correct).
@@ -148,6 +187,10 @@ Things the sample corpus actually contained, and what happens to them:
 --unknown ignore   with --yes: leave non-papers alone instead of Unsorted/
 --sample N         work on a random sample (--seed for reproducibility)
 --only SUBSTR      restrict to paths containing SUBSTR (repeatable)
+--no-ps            skip PostScript instead of converting it with ps2pdf
+--no-mathnet       do not look Cyrillic titles up on Math-Net.Ru
+--on-rate-limit skip   carry on without a registry that refuses requests
+                   (default: stop, and resume by running the same command)
 --offline          no network; metadata comes from the files alone
 --no-ocr           never shell out to tesseract
 --ocr-pages 1      OCR only the first page (about twice as fast)
@@ -171,8 +214,36 @@ arXiv asks callers to leave three seconds between queries, so it is consulted
 only when Crossref has not already produced an acceptable match (the Crossref
 record is the richer one anyway), and at most once per document.
 
-Every run writes `NEW_REPO/.paperorg/report.csv` (one row per input file:
-status, kind, confidence, source, identifier, destination) and caches API
+### When a registry says "too many requests"
+
+arXiv's documented limit is one request every three seconds over a single
+connection, which the tool keeps to. Beyond that it blocks an address outright
+with HTTP 429 for a cool-off it does not announce (no `Retry-After`; more than
+an hour when it happened here), and every further request keeps the block
+alive. So after three 429s in a row from one host the tool stops asking it and,
+by default, **stops the run** after the lookups already in flight: nothing is
+copied, no question is asked, and `NEW_REPO/.paperorg/RESUME.txt` says what
+happened and gives the command to run again. The exit code is 75 ("try again
+later"), for scripts.
+
+Resuming is running the same command again. File analyses, registry answers
+and your answers to prompts are all cached, so it continues where it stopped
+(and skips the "output folder exists" question). `--on-rate-limit skip`
+finishes without the refusing registry instead; the affected documents are
+tagged `[lookup incomplete: export.arxiv.org]` in `report.txt`, and a later run
+fills them in. A definite "not found" (HTTP 404) is cached; a refusal never is.
+
+Every run writes two reports into `NEW_REPO/.paperorg/`:
+
+* `report.txt`, for reading: everything that was *not* filed normally. That
+  means files skipped (read errors, failed `ps2pdf`, ignored at a prompt),
+  documents not recognised and put in `Unsorted/`, documents filed with metadata
+  read from the file because no registry matched, duplicates that were not
+  placed, and non-documents left in the input folder, grouped by extension.
+* `report.csv`, one row per input file (status, kind, confidence, source,
+  identifier, destination).
+
+It also caches API
 responses and per-file analysis in `NEW_REPO/.paperorg/cache.sqlite3`, so
 re-running after an interruption is cheap and makes no repeat network calls.
 

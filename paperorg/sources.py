@@ -4,6 +4,7 @@ Crossref  - DOIs, journals, pages, volumes (the workhorse).
 arXiv     - preprints, both by id and by title.
 zbMATH    - Zbl numbers and MSC classification (open API).
 OpenLibrary - books by title/ISBN, for the Books shelf.
+Math-Net.Ru - Russian journals under their original, Cyrillic titles.
 
 Every response goes through the cache, so a second run costs no traffic.
 """
@@ -34,6 +35,14 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV_NS = "{http://arxiv.org/schemas/atom}"
 
 
+_NOT_FOUND = {"__not_found__": True}
+
+# A host that answers "429 Too Many Requests" this many times in a row is left
+# alone for the rest of the run: arXiv's block outlasts any sensible retry,
+# and asking again only prolongs it.
+BLOCK_AFTER_429 = 3
+
+
 class Http:
     """Tiny HTTP helper: cache, retries, per-host rate limiting."""
 
@@ -43,6 +52,11 @@ class Http:
         self._locks: dict[str, threading.Lock] = {}
         self._last: dict[str, float] = {}
         self._guard = threading.Lock()
+        self._429: dict[str, int] = {}
+        self.blocked: set[str] = set()
+        # Hosts that failed to answer during the current item, per worker
+        # thread, so the pipeline can tell "not found" from "not asked".
+        self._item = threading.local()
         if requests is not None:
             self.session = requests.Session()
             self.session.headers["User-Agent"] = cfg.user_agent
@@ -60,50 +74,90 @@ class Http:
                 time.sleep(wait)
             self._last[host] = time.time()
 
-    def fetch(self, url: str, accept: str) -> tuple[int, str]:
-        """One HTTP GET. The single seam over requests / urllib, and the one
-        place tests need to stub."""
+    def begin_item(self) -> None:
+        self._item.failed = set()
+
+    def failed_hosts(self) -> set[str]:
+        return getattr(self._item, "failed", set())
+
+    def _failed(self, host: str) -> None:
+        if not hasattr(self._item, "failed"):
+            self._item.failed = set()
+        self._item.failed.add(host)
+
+    def fetch(self, url: str, accept: str, form: bytes | None = None) -> tuple[int, str]:
+        """One HTTP GET (or a form POST). The single seam over requests /
+        urllib, and the one place tests need to stub."""
         if self.session is not None:
-            r = self.session.get(url, timeout=self.cfg.http_timeout,
-                                 headers={"Accept": accept})
+            if form is None:
+                r = self.session.get(url, timeout=self.cfg.http_timeout,
+                                     headers={"Accept": accept})
+            else:
+                r = self.session.post(url, data=form, timeout=self.cfg.http_timeout,
+                                      headers={"Accept": accept, "Content-Type":
+                                               "application/x-www-form-urlencoded"})
             return r.status_code, r.text
         req = urllib.request.Request(
-            url, headers={"User-Agent": self.cfg.user_agent, "Accept": accept})
+            url, data=form, headers={"User-Agent": self.cfg.user_agent, "Accept": accept})
         with urllib.request.urlopen(req, timeout=self.cfg.http_timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace")
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.status, resp.read().decode(charset, "replace")
 
     def get(self, url: str, params: dict | None = None, *, delay: float = 0.0,
-            accept: str = "application/json", parse: str = "json") -> Any:
+            accept: str = "application/json", parse: str = "json",
+            form: dict | None = None) -> Any:
+        """GET *url* (POST when *form* is given), through the cache."""
         full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
-        key = f"{parse}:{full}"
+        data = urllib.parse.urlencode(form).encode("ascii") if form is not None else None
+        key = f"{parse}:{full}" + (f"#post:{data.decode()}" if data else "")
         hit = self.cache.get_http(key)
         if hit is not None:
+            if hit == _NOT_FOUND:
+                return None
             return hit if parse == "json" else hit.get("text", "")
 
         host = urllib.parse.urlsplit(url).netloc
+        if host in self.blocked:
+            self._failed(host)
+            return None
         body: Any = None
+        answered = False
         for attempt in range(self.cfg.retries):
             self._throttle(host, delay)
             try:
-                status, text = self.fetch(full, accept)
+                status, text = (self.fetch(full, accept) if data is None
+                                else self.fetch(full, accept, data))
+                if status == 429:
+                    with self._guard:
+                        self._429[host] = self._429.get(host, 0) + 1
+                        if self._429[host] >= BLOCK_AFTER_429:
+                            self.blocked.add(host)
+                    if host in self.blocked:
+                        break
+                else:
+                    self._429[host] = 0
                 if status == 200:
                     body = json.loads(text) if parse == "json" else text
+                    answered = True
                     break
                 if status in (404, 400):
-                    body = None
-                    break
+                    # A definite answer: zbMATH says "no hits" with a 404.
+                    self.cache.put_http(key, _NOT_FOUND)
+                    return None
                 if status in (429, 500, 502, 503, 504):
                     time.sleep(1.5 * (attempt + 1) + delay)
                     continue
-                body = None
+                body, answered = None, True     # some other definite refusal
                 break
             except Exception:
                 time.sleep(1.0 * (attempt + 1))
-        # Only successful, non-empty responses are cached. Storing a failure
-        # would turn one flaky moment into a permanent "not found" for the
-        # ninety days the cache lives.
+        # Beyond a definite 404/400, only successful, non-empty responses are
+        # cached. Storing a failure would turn one flaky moment into a
+        # permanent "not found" for the ninety days the cache lives.
         if body:
             self.cache.put_http(key, body if parse == "json" else {"text": body})
+        if not answered:
+            self._failed(host)
         return body
 
 
@@ -339,6 +393,125 @@ class Zbmath:
             rec.msc = codes
         if not rec.year and hit.get("year"):
             rec.year = str(hit["year"])
+
+
+# ------------------------------------------------------------- Math-Net.Ru
+
+class MathNet:
+    """Math-Net.Ru (Steklov Institute): the Russian journals, Cyrillic titles.
+
+    There is no API, so the search form and the paper pages are parsed. A
+    paper page carries what the other registries lack for Russian originals:
+    the original title, the MSC codes, and the DOI of the English translation.
+    """
+    BASE = "https://www.mathnet.ru"
+    DELAY = 1.0
+
+    def __init__(self, http: Http, cfg: Config) -> None:
+        self.http, self.cfg = http, cfg
+
+    def search(self, title: str = "", author: str = "") -> list[BibRecord]:
+        """Papers whose title contains every word of *title* (and *author*)."""
+        if not getattr(self.cfg, "mathnet", True) or not (title or author):
+            return []
+        form = {"keywords": title.encode("cp1251", "ignore"), "where_keyw": "title",
+                "authors": author.encode("cp1251", "ignore"), "tjrnid": ""}
+        page = self.http.get(f"{self.BASE}/php/searchpapers_do.phtml",
+                             {"jrnid": "", "option_lang": "rus"}, form=form,
+                             delay=self.DELAY, accept="text/html", parse="text")
+        return parse_mathnet_results(page or "")
+
+    def complete(self, rec: BibRecord) -> str:
+        """Fill in a search-row record from the paper's own pages; return the
+        DOI of the English translation, or ""."""
+        pid = rec.url.rsplit("/", 1)[-1]
+        rus = self.http.get(f"{self.BASE}/rus/{pid}", delay=self.DELAY,
+                            accept="text/html", parse="text") or ""
+        eng = self.http.get(f"{self.BASE}/eng/{pid}", delay=self.DELAY,
+                            accept="text/html", parse="text") or ""
+        return apply_mathnet_pages(rec, rus, eng)
+
+
+def _html_text(fragment: str) -> str:
+    import html as _html
+    t = re.sub(r"<[^>]+>", " ", fragment or "")
+    t = _html.unescape(t).replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _mathnet_authors(blob: str) -> list[Author]:
+    """"Н. А. Вавилов, А. В. Степанов" -> Authors (initials first)."""
+    names = [n.strip() for n in re.split(r",| и | and ", blob) if n.strip()]
+    return [_split_name(n) for n in names]
+
+
+_MN_ROW = re.compile(
+    r'<a class=SLink href="/rus/([a-z]+\d+)">(.*?)</a><br>(.*?)<br><i>(.*?)</i>,\s*'
+    r'(\d{4})(.*?)</td>', re.S)
+
+
+def parse_mathnet_results(page: str) -> list[BibRecord]:
+    out = []
+    for pid, title, authors, journal, year, rest in _MN_ROW.findall(page):
+        rec = BibRecord(kind=DocKind.PAPER, source="mathnet", language="russian")
+        rec.title = _html_text(title)
+        rec.authors = _mathnet_authors(_html_text(authors))
+        rec.journal = _html_text(journal)
+        rec.year = year
+        # ", 23 :3 , 261–309" once the markup is gone
+        m = re.match(r",\s*([\w-]+)\s*(?::\s*([\w-]+))?\s*"
+                     r"(?:,\s*(\d+(?:\s*[-\u2013]\s*\d+)?))?", _html_text(rest))
+        if m:
+            rec.volume, rec.number = m.group(1) or "", m.group(2) or ""
+            rec.pages = re.sub(r"\s*[-\u2013]\s*", "--", m.group(3) or "")
+        rec.url = f"{MathNet.BASE}/rus/{pid}"
+        out.append(rec)
+    return out
+
+
+_MN_TRANSLATION = re.compile(r"Английская версия:|English version:")
+
+
+def apply_mathnet_pages(rec: BibRecord, rus: str, eng: str) -> str:
+    """Identifiers, MSC and the English translation, from the paper pages.
+    Returns the translation's DOI, or ""."""
+    # Math-Net.Ru registers the Russian originals under its own prefix
+    # 10.4213; any other DOI on the page is the translation's (it is shown in
+    # the page header as well as in the "English version" block).
+    parts = _MN_TRANSLATION.split(rus, 1)
+    tail = parts[1] if len(parts) == 2 else ""
+    doi_re = r"doi\.org/(10\.\d{4,9}/[^'\"\s<>]+)"
+    dois = list(dict.fromkeys(re.findall(doi_re, rus)))
+    original = [d for d in dois if d.startswith("10.4213/")]
+    translated = [d for d in re.findall(doi_re, tail) if not d.startswith("10.4213/")] \
+        or [d for d in dois if not d.startswith("10.4213/")]
+    if original:
+        rec.doi = original[0]
+    page = rus or eng
+    rec.msc = list(dict.fromkeys(re.findall(r"msc-search\?text=([0-9]{2}[A-Z0-9-][0-9x]{2})", page)))
+    if (m := re.search(r"mathscinet-getitem\?mr=(\d+)", page)):
+        rec.mrnumber = m.group(1)
+    if (m := re.search(r"zbmath\.org/\?q=an:([\d.]+)", page)):
+        rec.zbl = m.group(1)
+
+    # The English page: Latin spelling of the names (so that the folders
+    # match the rest of the library) and the translation's reference.
+    m = re.search(r"<title>(.*?)</title>", eng, re.S)
+    cite = _html_text(m.group(1)) if m else ""
+    m = re.match(r"(.*?),\s*\u201c(.*)\u201d,\s*(.*)", cite)
+    if m:
+        names, en_title, where = m.groups()
+        latin = _mathnet_authors(names)
+        if latin and len(latin) == len(rec.authors or latin):
+            rec.authors = latin
+        if translated:
+            # "Algebra i Analiz, 23:3 (2011), 261–309; St. Petersburg Math. J.,
+            # 23:3 (2012), 603–635": the translation is the last reference.
+            where = where.rsplit("; ", 1)[-1]
+            rec.bib_note = f"English translation: \u201c{en_title}\u201d, {where}, doi:{translated[0]}"
+        else:
+            rec.bib_note = f"English title: \u201c{en_title}\u201d"
+    return translated[0] if translated else ""
 
 
 # --------------------------------------------------------------- OpenLibrary

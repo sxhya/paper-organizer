@@ -148,6 +148,15 @@ _CYR = {
 }
 
 
+def is_cyrillic(s: str, share: float = 0.3) -> bool:
+    """Is at least *share* of the letters in *s* Cyrillic?"""
+    letters = [c for c in s or "" if c.isalpha()]
+    if not letters:
+        return False
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04ff")
+    return cyr >= share * len(letters)
+
+
 def translit(s: str) -> str:
     """Fold a string to ASCII letters, transliterating Cyrillic."""
     out = []

@@ -9,17 +9,18 @@ from pathlib import Path
 from . import bibtex
 from .cache import Cache, NullCache
 from .classify import classify
-from .config import Config, DJVU_EXTS, PDF_EXTS
+from .config import Config, DJVU_EXTS, PDF_EXTS, PS_EXTS, UNSORTED_DIR
 from .dedupe import Item, group_bib_duplicates, group_byte_duplicates, rank_versions
-from .extract import (EXTRACT_VERSION, analyse, extract_school,
-                      name_stem, sniff_format)
+from .extract import (EXTRACT_VERSION, analyse, detect_format, extract_school, have,
+                      name_stem, readable_copy, sniff_format)
 from .match import Resolver, parse_author_list
 from .people import (AuthorIndex, plausible_local_title,
                      plausible_person, prefer_richer)
 from .prompts import BOLD, CYAN, DIM, GREEN, RESET, YELLOW, Prompter
 from .record import BibRecord, DocFeatures, DocKind
 from .repo import RepoWriter, plan_placement
-from .sources import Arxiv, Crossref, Http, OpenLibrary, Zbmath
+from .util import crc32_file, is_cyrillic
+from .sources import Arxiv, Crossref, Http, MathNet, OpenLibrary, Zbmath
 
 
 class Progress:
@@ -64,38 +65,53 @@ class Organizer:
         # output folder already exist?" question has to be answered first.
         self.output_existed = cfg.output_dir.exists()
         self.cache = NullCache() if cfg.cache_path is None else Cache(cfg.cache_path)
-        http = Http(cfg, self.cache)
+        http = self.http = Http(cfg, self.cache)
         self.resolver = Resolver(cfg, Crossref(http, cfg), Arxiv(http, cfg),
-                                 Zbmath(http, cfg), OpenLibrary(http, cfg))
+                                 Zbmath(http, cfg), OpenLibrary(http, cfg),
+                                 MathNet(http, cfg))
         self.prompter = Prompter(cfg, self.cache)
         self.writer = RepoWriter(cfg)
         self.stats: dict[str, int] = {}
-        self.skipped_files = 0
+        self.ignored: list[Path] = []      # neither PDF, DjVu nor PostScript
         self.sniffed = 0
+        # PostScript or gzipped input -> the PDF/DjVu made from it, which is
+        # what gets read and placed in the repository.
+        self.converted: dict[Path, Path] = {}
+
+    @property
+    def skipped_files(self) -> int:
+        return len(self.ignored)
 
     # -------------------------------------------------------------- 1. scan
     def scan(self) -> list[Path]:
         """Collect candidate documents, by extension or by content.
 
         Files whose name lost its extension are common in an unsorted pile,
-        so anything the name does not classify is sniffed for a PDF/DjVu
+        so anything the name does not classify is sniffed for a PDF/DjVu/PS
         header before being discarded.
         """
         exts = set(PDF_EXTS)
         if self.cfg.djvu:
             exts |= DJVU_EXTS
+        if self.cfg.ps:
+            exts |= PS_EXTS
         found: list[Path] = []
-        self.skipped_files = 0
+        self.ignored = []
         sniffed: set[Path] = set()
         for p in sorted(self.cfg.input_dir.rglob("*")):
             if not p.is_file() or p.is_symlink():
                 continue
             if self.cfg.only and not any(s.lower() in str(p).lower() for s in self.cfg.only):
                 continue
+            # "._Name.pdf" is the macOS resource fork of "Name.pdf", not a copy.
+            if p.name.startswith("._"):
+                self.ignored.append(p)
+                continue
             if p.suffix.lower() not in exts:
-                fmt = sniff_format(p)
-                if not fmt or (fmt == "djvu" and not self.cfg.djvu):
-                    self.skipped_files += 1
+                fmt = sniff_format(p).removesuffix(".gz")
+                if not fmt or (fmt == "djvu" and not self.cfg.djvu) \
+                        or (fmt == "ps" and not self.cfg.ps):
+                    self.ignored.append(p)
                     continue
                 sniffed.add(p)
             found.append(p)
@@ -114,12 +130,18 @@ class Organizer:
         prog = Progress(len(paths), "reading files")
 
         def work(path: Path) -> DocFeatures:
-            from .util import crc32_file
             try:
                 crc = crc32_file(path)
             except OSError as exc:
                 f = DocFeatures(path=path, error=str(exc))
                 return f
+            doc, err = readable_copy(path, detect_format(path),
+                                     self.cfg.state_dir / "converted", crc,
+                                     ps_timeout=self.cfg.ps_timeout)
+            if err:
+                return DocFeatures(path=path, error=err)
+            if doc:
+                self.converted[path] = doc
             crc_key = f"{crc}:v{EXTRACT_VERSION}"
             cached = self.cache.get_doc(crc_key)
             if cached:
@@ -130,18 +152,22 @@ class Organizer:
                     feat = DocFeatures(**cached)
                 except TypeError:
                     feat = None
+                if feat is not None and feat.fmt == "djvu" and not feat.pages \
+                        and have("djvused"):
+                    feat = None     # read before djvulibre was installed
                 if feat is not None:
                     if feat.text:
                         return feat
                     if not feat.ocr_used:
                         # Cheap and deterministic: just read it again.
                         from .extract import pdf_text, djvu_text
-                        feat.text = (djvu_text(path) if path.suffix.lower() in DJVU_EXTS
-                                     else pdf_text(path))
+                        src = doc or path
+                        feat.text = (djvu_text(src) if feat.fmt == "djvu"
+                                     else pdf_text(src))
                         return feat
                     # An OCR'd scan with no cached text would classify
                     # differently from a fresh run, so redo the analysis.
-            feat = analyse(path, self.cfg)
+            feat = analyse(path, self.cfg, doc)
             self.cache.put_doc(crc_key, feat.to_json())
             return feat
 
@@ -172,26 +198,67 @@ class Organizer:
             it.kind_reason = reason
 
     # ----------------------------------------------------------- 4. resolve
-    def resolve_all(self, items: list[Item]) -> None:
+    def resolve_all(self, items: list[Item]) -> bool:
+        """Look every document up. False when the run has to stop because a
+        registry is refusing to answer (and --on-rate-limit is "stop")."""
         todo = [i for i in items
                 if i.status == "pending" and i.feat_kind is not DocKind.OTHER]
         prog = Progress(len(todo), "looking up metadata")
+        stopping = self.cfg.on_rate_limit == "stop"
 
+        # A refusing host is not asked again (Http.blocked), but the lookup
+        # carries on: cached answers and the other registries still count,
+        # and all of that is progress the next run does not repeat.
         def work(it: Item):
-            return self.resolver.resolve(it.feat, it.feat_kind)
+            self.http.begin_item()
+            rec, cands = self.resolver.resolve(it.feat, it.feat_kind)
+            return rec, cands, sorted(self.http.failed_hosts())
 
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.crossref_workers)) as pool:
             futures = {pool.submit(work, it): it for it in todo}
             for fut in as_completed(futures):
                 it = futures[fut]
                 try:
-                    rec, cands = fut.result()
+                    rec, cands, it.lookup_failed = fut.result()
                 except Exception as exc:                       # pragma: no cover
                     rec, cands = None, []
                     it.note = f"lookup failed: {exc}"
                 it.record, it.candidates = rec, cands
                 prog.step(it.path.name)
         prog.done()
+        if stopping and self.http.blocked:
+            return False
+        for host in sorted(self.http.blocked):
+            print(f"  {YELLOW}{host} is rate-limiting this machine (HTTP 429); it was "
+                  f"not asked again this run. Re-run later to finish those "
+                  f"lookups.{RESET}")
+        return True
+
+    @property
+    def resume_path(self) -> Path:
+        return self.cfg.state_dir / "RESUME.txt"
+
+    def _write_resume(self, items: list[Item]) -> None:
+        """Say why the run stopped and how to pick it up again."""
+        import shlex
+        from datetime import datetime
+        todo = [i for i in items
+                if i.status == "pending" and i.feat_kind is not DocKind.OTHER]
+        done = sum(1 for i in todo if not i.lookup_failed)
+        hosts = ", ".join(sorted(self.http.blocked))
+        cmd = shlex.join(sys.argv) if sys.argv and sys.argv[0] else "./organize.py ..."
+        self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        self.resume_path.write_text(
+            f"paper-organizer stopped at {datetime.now():%Y-%m-%d %H:%M}\n\n"
+            f"{hosts} started refusing requests (HTTP 429 Too Many Requests).\n"
+            f"Looked up {done} of {len(todo)} documents before stopping; nothing\n"
+            f"was copied and no questions were asked.\n\n"
+            f"Everything done so far is cached. To continue, run the same command\n"
+            f"again once the block has lifted (usually an hour or more):\n\n"
+            f"    {cmd}\n\n"
+            f"To finish now without {hosts}, add  --on-rate-limit skip ; the documents\n"
+            f"it could not check are tagged [lookup incomplete] in report.txt, and\n"
+            f"a later run fills them in.\n", encoding="utf-8")
 
     # ------------------------------------------------- 5. human decisions
     def decide(self, items: list[Item]) -> None:
@@ -203,7 +270,9 @@ class Organizer:
                                                  and it.feat_kind is DocKind.UNKNOWN):
                 action = self.prompter.classify_unknown(it, it.kind_reason)
                 if action == "ignore":
-                    it.status, it.note = "skipped", "ignored by user"
+                    it.status = "skipped"
+                    it.note = ("not recognised; left alone" if not self.cfg.interactive
+                               else "not recognised; ignored by user")
                 elif action == "unsorted":
                     it.record = self._fallback_record(it, DocKind.OTHER)
                 else:
@@ -213,14 +282,18 @@ class Organizer:
                     rec, cands = self.resolver.resolve(it.feat, kind)
                     it.record, it.candidates = rec, cands
                     if not it.record:
-                        it.record = self.prompter.confirm_match(it, cands) \
-                            or self._fallback_record(it, kind)
+                        chosen = self.prompter.confirm_match(it, cands)
+                        if chosen:
+                            self.resolver.finish(chosen, kind)
+                        it.record = chosen or self._fallback_record(it, kind)
 
         # 5b. uncertain matches
         for it in items:
             if it.status != "pending" or it.record is not None:
                 continue
             chosen = self.prompter.confirm_match(it, it.candidates)
+            if chosen:
+                self.resolver.finish(chosen, it.feat_kind)
             it.record = chosen or self._fallback_record(it, it.feat_kind)
             if not chosen:
                 it.note = it.note or "no registry match; metadata read from the file"
@@ -298,8 +371,12 @@ class Organizer:
         for it in placeable:
             rec = it.record
             placement = plan_placement(rec, it.feat.suffix)
+            source = self.converted.get(it.path, it.path)
             try:
-                actual = self.writer.place(it.path, placement, crc=it.feat.crc32)
+                # The repository holds the converted PDF, so a resumed run has
+                # to recognise that file, not the PostScript original.
+                crc = crc32_file(source) if source != it.path else it.feat.crc32
+                actual = self.writer.place(source, placement, crc=crc)
             except OSError as exc:
                 it.status, it.note = "skipped", f"copy failed: {exc}"
                 prog.step(it.path.name)
@@ -320,6 +397,7 @@ class Organizer:
         # A dry run still writes the plan: inspecting report.csv before
         # committing is the whole point of running one.
         self._write_report(items)
+        self._write_text_report(items)
         if self.cfg.dry_run:
             return
         placed = sum(1 for i in items if i.status == "placed")
@@ -351,13 +429,116 @@ class Organizer:
                     it.note,
                 ])
 
+    def _write_text_report(self, items: list[Item]) -> None:
+        """What the run did *not* do, for a human to read: files it left
+        behind, files it could not place, and files it placed without being
+        sure what they are."""
+        from datetime import datetime
+        cfg = self.cfg
+
+        def rel(p: Path) -> str:
+            try:
+                return str(p.relative_to(cfg.input_dir))
+            except ValueError:
+                return str(p)
+
+        # Russian-language material is what the registries cover worst, so it
+        # is flagged to show how much of each section it accounts for.
+        def russian(it: Item) -> bool:
+            return is_cyrillic(it.feat.text[:4000]) or is_cyrillic(it.path.name)
+
+        def head(it: Item) -> str:
+            tags = (["Cyrillic"] if russian(it) else []) + \
+                [f"lookup incomplete: {h}" for h in it.lookup_failed]
+            return rel(it.path) + "".join(f"   [{t}]" for t in tags)
+
+        placed = [i for i in items if i.status == "placed"]
+        vague = (DocKind.OTHER, DocKind.UNKNOWN)
+        unsorted = [i for i in placed if i.record.kind in vague]
+        local = [i for i in placed
+                 if i.record.source == "local" and i.record.kind not in vague]
+        skipped = [i for i in items if i.status == "skipped"]
+        dupes = [i for i in items if i.status in ("duplicate", "byte-duplicate")]
+        converted = [i for i in placed if i.path in self.converted]
+
+        by_ext: dict[str, list[Path]] = {}
+        for p in self.ignored:
+            key = ("._*  (macOS resource forks)" if p.name.startswith("._")
+                   else p.suffix.lower() or "(no extension)")
+            by_ext.setdefault(key, []).append(p)
+
+        verb = "would be " if cfg.dry_run else ""
+        out = [
+            "paper-organizer run report",
+            "",
+            f"input:   {cfg.input_dir}",
+            f"output:  {cfg.output_dir}",
+            f"date:    {datetime.now():%Y-%m-%d %H:%M}"
+            + ("  (dry run: nothing was copied)" if cfg.dry_run else ""),
+            "",
+            f"  {len(placed):6}  {verb}placed in the repository",
+            f"  {len(unsorted):6}    of them not recognised ({verb}filed in Unsorted/)",
+            f"  {len(local):6}    of them with metadata read from the file only",
+            f"  {len(converted):6}    of them converted (PostScript, gzip)",
+            f"  {len(skipped):6}  skipped",
+            f"  {len(dupes):6}  duplicates, not placed",
+            f"  {len(self.ignored):6}  not a document, left where it is",
+        ]
+
+        def section(title: str, blurb: str, its: list[Item], details) -> None:
+            if not its:
+                return
+            ru = sum(1 for i in its if russian(i))
+            short = sum(1 for i in its if i.lookup_failed)
+            count = ", ".join([str(len(its))]
+                              + ([f"{ru} in Cyrillic"] if ru else [])
+                              + ([f"{short} with lookups incomplete"] if short else []))
+            out.extend(["", "", f"== {title} ({count}) ==", blurb, ""])
+            # Russian items together, so the size of that block is visible.
+            for it in sorted(its, key=lambda i: (not russian(i), rel(i.path))):
+                out.append(f"  {head(it)}")
+                out.extend(f"      {d}" for d in details(it) if d)
+
+        section("Skipped",
+                "Read errors, failed conversions, and files you chose not to file.",
+                skipped, lambda i: [i.note])
+        section("Not recognised",
+                "Not identified as a paper, book or thesis; "
+                f"{verb}filed in {UNSORTED_DIR}/ under a name guessed from the file.",
+                unsorted,
+                lambda i: [f"-> {i.placement.primary}",
+                           f"why: {i.kind_reason}" if i.kind_reason else ""])
+        section("No registry match",
+                "Recognised, but title and authors come from the file itself; "
+                "worth checking.",
+                local,
+                lambda i: [f"-> {i.placement.primary}  [{i.record.kind.value}]",
+                           f"title read: {i.record.title[:100]}"])
+        section("Duplicates",
+                "Another copy of the same document was placed instead.",
+                dupes, lambda i: [i.note])
+        if by_ext:
+            n = len(self.ignored)
+            out.extend(["", "", f"== Not a document ({n}) ==",
+                        "Neither PDF, DjVu nor PostScript"
+                        + (" (DjVu is off: --no-djvu)" if not cfg.djvu else "")
+                        + (" (PostScript is off: --no-ps)" if not cfg.ps else "")
+                        + "; left in the input folder.", ""])
+            for ext, paths in sorted(by_ext.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                out.append(f"  {ext}  ({len(paths)})")
+                out.extend(f"      {rel(p)}" for p in paths)
+
+        path = cfg.state_dir / "report.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
     # ------------------------------------------------------------------ run
     def run(self) -> dict:
         cfg = self.cfg
         print(f"{BOLD}paper-organizer{RESET}  {cfg.input_dir}  ->  {cfg.output_dir}")
         if cfg.dry_run:
             print(f"  {YELLOW}dry run: no document is copied; the plan goes to "
-                  f"{cfg.state_dir.name}/report.csv{RESET}")
+                  f"{cfg.state_dir.name}/report.txt and report.csv{RESET}")
 
         paths = self.scan()
         extra = ""
@@ -367,16 +548,26 @@ class Organizer:
         if self.skipped_files:
             where = " in the input tree" if (self.cfg.sample or self.cfg.limit) else ""
             print(f"  {DIM}ignored {self.skipped_files} file(s){where} that are "
-                  f"neither PDF nor DjVu (.ps, .dvi, .tex, ...){RESET}")
+                  f"neither PDF, DjVu nor PostScript (.dvi, .tex, ...){RESET}")
         if not paths:
+            if self.ignored:
+                self._write_text_report([])
+                print(f"  report        {CYAN}{cfg.state_dir / 'report.txt'}{RESET}")
             return {"found": 0}
 
-        if not cfg.dry_run and self.output_existed and \
+        resuming = self.resume_path.exists()
+        if resuming:
+            print(f"  {CYAN}resuming the run that stopped earlier "
+                  f"({self.resume_path.relative_to(cfg.output_dir)}){RESET}")
+        if not cfg.dry_run and self.output_existed and not resuming and \
                 not self.prompter.confirm_overwrite(cfg.output_dir, len(paths)):
             print("  aborted.")
             return {"aborted": True}
 
         all_items = self.analyse_all(paths)
+        if self.converted:
+            print(f"  {DIM}converted {len(self.converted)} PostScript/gzipped "
+                  f"file(s) to PDF/DjVu{RESET}")
         items, byte_dupes = group_byte_duplicates(all_items)
         if byte_dupes:
             print(f"  {DIM}dropped {byte_dupes} byte-identical duplicate(s){RESET}")
@@ -388,8 +579,13 @@ class Organizer:
                 kinds[it.feat_kind.value] = kinds.get(it.feat_kind.value, 0) + 1
         print("  classified: " + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items())))
 
-        if cfg.online:
-            self.resolve_all(items)
+        if cfg.online and not self.resolve_all(items):
+            self._write_resume(items)
+            hosts = ", ".join(sorted(self.http.blocked))
+            print(f"\n  {YELLOW}{hosts} is refusing requests (HTTP 429), so the run "
+                  f"stops here.{RESET}\n  Progress is cached; see {self.resume_path} "
+                  f"for how to continue.")
+            return {"interrupted": hosts}
         self.decide(items)
         schools = self.fill_thesis_schools(items)
         if schools:
@@ -404,6 +600,7 @@ class Organizer:
         # were set aside before classification.
         self.write_outputs(all_items, entries)
         removed = self.writer.prune_empty()
+        self.resume_path.unlink(missing_ok=True)
 
         return self._summarise(all_items, entries, byte_dupes, removed)
 
@@ -438,7 +635,7 @@ def print_summary(cfg: Config, stats: dict) -> None:
     if not stats or stats.get("found") == 0:
         print("  nothing to do.")
         return
-    if stats.get("aborted"):
+    if stats.get("aborted") or stats.get("interrupted"):
         return
     ident = stats["identified"]
     placed = max(stats["placed"], 1)
@@ -459,4 +656,5 @@ def print_summary(cfg: Config, stats: dict) -> None:
                                                            key=lambda x: -x[1])))
     if not cfg.dry_run:
         print(f"\n  bibliography  {CYAN}{cfg.bib_path}{RESET}")
-    print(f"  run report    {CYAN}{cfg.state_dir / 'report.csv'}{RESET}")
+    print(f"  run report    {CYAN}{cfg.state_dir / 'report.txt'}{RESET}"
+          f"  {DIM}(every file: report.csv){RESET}")

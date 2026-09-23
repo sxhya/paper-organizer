@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--only", action="append", default=[],
                    help="only paths containing this substring (repeatable)")
     g.add_argument("--no-djvu", action="store_true", help="skip .djvu files")
+    g.add_argument("--no-ps", action="store_true",
+                   help="skip .ps files instead of converting them with ps2pdf")
 
     g = p.add_argument_group("behaviour")
     g.add_argument("-n", "--dry-run", action="store_true",
@@ -55,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "as fast and usually enough for the title)")
     g.add_argument("--ocr-dpi", type=int, default=300, metavar="D",
                    help="render resolution for OCR (default: 300)")
+    g.add_argument("--on-rate-limit", choices=("stop", "skip"), default="stop",
+                   help="when a registry starts refusing requests: stop and "
+                        "resume later (default), or carry on without it")
+    g.add_argument("--no-mathnet", action="store_true",
+                   help="do not look up Cyrillic titles on Math-Net.Ru")
     g.add_argument("--no-zbmath", action="store_true",
                    help="skip the zbMATH enrichment (Zbl number, MSC codes)")
 
@@ -81,7 +88,8 @@ def check_tools(cfg: Config) -> None:
     optional = {"tesseract": "OCR for scanned papers",
                 "pdftoppm": "rendering pages for OCR (poppler-utils)",
                 "djvutxt": "reading DjVu text (djvulibre-bin)",
-                "ddjvu": "rendering DjVu for OCR (djvulibre-bin)"}
+                "ddjvu": "rendering DjVu for OCR (djvulibre-bin)",
+                "ps2pdf": "converting PostScript to PDF (ghostscript)"}
     missing = [f"{t} - {why}" for t, why in required.items() if not have(t)]
     if missing:
         print(f"{YELLOW}missing required tools:{RESET}", file=sys.stderr)
@@ -95,6 +103,9 @@ def check_tools(cfg: Config) -> None:
     if cfg.djvu and not have("djvutxt"):
         print(f"  {DIM}note: djvulibre-bin is not installed, so DjVu files are "
               f"filed from their name alone{RESET}")
+    if cfg.ps and not have("ps2pdf"):
+        print(f"  {DIM}note: ghostscript (ps2pdf) is not installed, so PostScript "
+              f"files are reported as skipped{RESET}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,12 +124,15 @@ def main(argv: list[str] | None = None) -> int:
         ocr_max_pages=max(1, args.ocr_pages),
         ocr_dpi=args.ocr_dpi,
         djvu=not args.no_djvu,
+        ps=not args.no_ps,
         online=not args.offline,
         zbmath=not args.no_zbmath,
+        mathnet=not args.no_mathnet,
         accept_score=args.accept,
         review_score=args.review,
         mailto=args.mailto,
         default_unknown_action=args.unknown,
+        on_rate_limit=args.on_rate_limit,
         link_mode=args.links,
         limit=args.limit,
         sample=args.sample,
@@ -142,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\ninterrupted - progress is cached, re-run to continue.", file=sys.stderr)
         return 130
     print_summary(cfg, stats)
-    return 0
+    return 75 if stats.get("interrupted") else 0      # 75: EX_TEMPFAIL
 
 
 if __name__ == "__main__":

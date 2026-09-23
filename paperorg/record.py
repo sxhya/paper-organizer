@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,8 @@ class BibRecord:
     url: str = ""
     msc: list[str] = field(default_factory=list)
     language: str = ""
-    note: str = ""
+    note: str = ""             # the registry's own type ("journal-article", ...)
+    bib_note: str = ""         # free text for the BibTeX note field
     source: str = ""           # which resolver produced this record
     confidence: float = 0.0
 
@@ -124,6 +126,12 @@ def _looks_like_a_title(s: str) -> bool:
         return False
     letters = sum(1 for c in s if c.isalpha())
     return letters >= 0.6 * len(s)
+
+
+# What converters and word processors leave in the Title field: the source
+# file's name ("thesis.dvi", "Microsoft Word - talk.doc"), not a title.
+_FILENAME_TITLE = re.compile(
+    r"(?i)^(microsoft (word|powerpoint) - .*|.*\.(dvi|tex|ps|pdf|docx?|pptx?|rtf|odt))$")
 
 
 @dataclass
@@ -171,8 +179,10 @@ class DocFeatures:
         not, so there the document's own typography comes first.
         """
         named = bool(self.file_authors) and _looks_like_a_title(self.file_title)
-        order = ((self.file_title, self.page_title, self.meta_title) if named
-                 else (self.page_title, self.meta_title, self.file_title))
+        meta = self.meta_title.strip()
+        meta = "" if _FILENAME_TITLE.match(meta) else meta
+        order = ((self.file_title, self.page_title, meta) if named
+                 else (self.page_title, meta, self.file_title))
         out: list[str] = []
         for t in order:
             t = (t or "").strip()

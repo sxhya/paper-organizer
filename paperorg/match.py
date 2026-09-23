@@ -6,10 +6,11 @@ from dataclasses import dataclass
 
 from .classify import refine_with_metadata
 from .config import Config
+from .extract import name_stem
 from .record import Author, BibRecord, DocFeatures, DocKind
 from .people import plausible_local_title, plausible_person, prefer_richer
-from .sources import Arxiv, Crossref, OpenLibrary, Zbmath, _split_name
-from .util import norm, similarity
+from .sources import Arxiv, Crossref, MathNet, OpenLibrary, Zbmath, _split_name
+from .util import is_cyrillic, norm, similarity, translit
 
 # Words that a title-only match should not be allowed to hinge on.
 _STOP = {"the", "a", "an", "of", "on", "in", "for", "and", "with", "to", "over"}
@@ -55,13 +56,19 @@ def _surnames(blob: str) -> set[str]:
 
 
 def author_agreement(rec: BibRecord, hint: str) -> float:
-    """0..1 overlap between record authors and the author hint we extracted."""
-    want = _surnames(hint)
+    """0..1 overlap between record authors and the author hint we extracted.
+
+    Names are compared transliterated, so "N. Vavilov" in a file name agrees
+    with "Н. А. Вавилов" on Math-Net.Ru; schemes differ ("Petrov"/"Петров" is
+    exact, "Jagodovskij"/"Ягодовский" is not), hence the fuzzy fallback.
+    """
+    want = {translit(w) for w in _surnames(hint)}
     have = {norm(a.family or a.literal) for a in rec.authors}
-    have = {h.split()[-1] for h in have if h}
+    have = {translit(h.split()[-1]) for h in have if h}
     if not want or not have:
         return 0.0
-    return len(want & have) / min(len(want), len(have))
+    hits = sum(1 for w in want if w in have or any(similarity(w, h) >= 0.8 for h in have))
+    return min(1.0, hits / min(len(want), len(have)))
 
 
 def _year(value: str) -> int:
@@ -99,8 +106,10 @@ class Resolver:
     """Runs the identification cascade for one document."""
 
     def __init__(self, cfg: Config, crossref: Crossref, arxiv: Arxiv,
-                 zbmath: Zbmath, openlib: OpenLibrary) -> None:
+                 zbmath: Zbmath, openlib: OpenLibrary,
+                 mathnet: MathNet | None = None) -> None:
         self.cfg = cfg
+        self.mathnet = mathnet
         self.crossref = crossref
         self.arxiv = arxiv
         self.zbmath = zbmath
@@ -163,6 +172,14 @@ class Resolver:
                 continue
             seen.add(key)
 
+            # Russian originals are indexed under their Cyrillic titles only
+            # on Math-Net.Ru; Crossref and arXiv hold at best the translation.
+            if self.mathnet and is_cyrillic(title):
+                for rec in self._mathnet_search(title, hint):
+                    out.append(score_candidate(rec, title, hint, year))
+                if out and max(c.score for c in out) >= self.cfg.accept_score:
+                    break
+
             if kind is DocKind.BOOK:
                 for rec in self.crossref.search(title, hint, rows=4, filters="type:book"):
                     out.append(score_candidate(rec, title, hint, year))
@@ -188,19 +205,51 @@ class Resolver:
                 break
         return _dedupe(out)
 
+    def _mathnet_search(self, title: str, hint: str) -> list[BibRecord]:
+        """Every word must match on Math-Net.Ru, so one OCR slip or a
+        misspelt file name loses the paper; the fallback asks for the
+        author's surname and the title's three most distinctive words."""
+        words = re.findall(r"[\w'-]+", re.sub(r"\$[^$]*\$", " ", title))
+        found = self.mathnet.search(" ".join(words[:10]))
+        if found:
+            return found[:6]
+        surname = _first_surname(hint) if is_cyrillic(hint) else ""
+        longest = sorted((w for w in words if len(w) > 4), key=len, reverse=True)[:3]
+        if surname and longest:
+            return self.mathnet.search(" ".join(longest), surname)[:6]
+        return []
+
     @staticmethod
     def _year_hint(feat: DocFeatures) -> str:
         m = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", feat.text[:1500])
         return m.group(1) if m else ""
 
     # -------------------------------------------------------------- finishing
+    def finish(self, rec: BibRecord, kind: DocKind) -> None:
+        """Complete an accepted (or user-chosen) record."""
+        self._finish(rec, kind)
+
     def _finish(self, rec: BibRecord, kind: DocKind) -> None:
+        translation = ""
+        if rec.source == "mathnet" and self.mathnet:
+            try:
+                translation = self.mathnet.complete(rec)
+            except Exception:
+                pass
         rec.kind = refine_with_metadata(kind, rec.note,
                                         has_journal=bool(rec.journal))
+        if rec.msc and rec.zbl:
+            return                  # Math-Net.Ru already gave what zbMATH would
+        # zbMATH indexes a Russian paper by its translation's DOI.
+        probe = BibRecord(doi=translation, title=rec.title) \
+            if translation and not rec.doi else rec
         try:
-            self.zbmath.enrich(rec)
+            self.zbmath.enrich(probe)
         except Exception:
             pass
+        if probe is not rec:
+            rec.msc = rec.msc or probe.msc
+            rec.zbl = rec.zbl or probe.zbl
 
     @staticmethod
     def _merge(primary: BibRecord, extra: BibRecord) -> BibRecord:
@@ -219,7 +268,7 @@ class Resolver:
         """No network: synthesise a record from the file itself."""
         titles = [t for t in feat.title_candidates() if plausible_local_title(t)]
         if not titles:
-            titles = [feat.path.stem]
+            titles = [name_stem(feat.path)]
         rec = BibRecord(kind=kind if kind is not DocKind.UNKNOWN else DocKind.PAPER,
                         source="local", confidence=0.4)
         rec.title = titles[0]

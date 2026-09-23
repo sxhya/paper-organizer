@@ -6,6 +6,7 @@ dependencies beyond ``requests``.
 """
 from __future__ import annotations
 
+import gzip
 import os
 import re
 import shutil
@@ -14,7 +15,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from .config import Config, DJVU_EXTS, OTHER_DOC_EXTS, PDF_EXTS
+from .config import Config, DJVU_EXTS, OTHER_DOC_EXTS, PDF_EXTS, PS_EXTS
 from .record import DocFeatures
 from .util import crc32_file
 
@@ -34,23 +35,39 @@ def have(tool: str) -> bool:
 # is what decides, so unrecognised names are sniffed rather than skipped.
 _MAGIC_PDF = b"%PDF"
 _MAGIC_DJVU = b"AT&TFORM"
+_MAGIC_PS = b"%!PS"
+_MAGIC_GZIP = b"\x1f\x8b"
 
 
 def sniff_format(path: Path) -> str:
-    """Return "pdf", "djvu" or "" by looking at the first bytes of the file."""
+    """Return "pdf", "djvu", "ps" or "" by looking at the first bytes of the file.
+
+    A gzipped document gives the inner format plus ".gz" ("ps.gz"); a gzipped
+    anything-else gives "".
+    """
     try:
         with open(path, "rb") as fh:
             head = fh.read(24)
-    except OSError:
+        if head.startswith(_MAGIC_GZIP):
+            with gzip.open(path, "rb") as fh:
+                inner = _sniff_head(fh.read(24))
+            return f"{inner}.gz" if inner else ""
+    except (OSError, EOFError):
         return ""
+    return _sniff_head(head)
+
+
+def _sniff_head(head: bytes) -> str:
     if head.startswith(_MAGIC_PDF):
         return "pdf"
     if head.startswith(_MAGIC_DJVU) and head[12:16] in (b"DJVU", b"DJVM", b"DJVI"):
         return "djvu"
+    if head.startswith(_MAGIC_PS):
+        return "ps"
     return ""
 
 
-_DOC_EXTS = PDF_EXTS | DJVU_EXTS | OTHER_DOC_EXTS
+_DOC_EXTS = PDF_EXTS | DJVU_EXTS | PS_EXTS | OTHER_DOC_EXTS
 
 
 def name_stem(path: Path) -> str:
@@ -61,6 +78,8 @@ def name_stem(path: Path) -> str:
     ``G. Garkusha, I. Panin - Framed motives...`` it would return
     ``G. Garkusha, I``.
     """
+    if path.suffix.lower() == ".gz":
+        return name_stem(path.with_suffix(""))
     return path.stem if path.suffix.lower() in _DOC_EXTS else path.name
 
 
@@ -71,7 +90,84 @@ def detect_format(path: Path) -> str:
         return "pdf"
     if ext in DJVU_EXTS:
         return "djvu"
+    if ext in PS_EXTS:
+        return "ps"
     return sniff_format(path)
+
+
+def readable_copy(path: Path, fmt: str, workdir: Path, key: str,
+                  ps_timeout: int = 180) -> tuple[Path | None, str]:
+    """A PDF or DjVu that the extractors can read, standing in for *path*.
+
+    Gzipped documents are unpacked and PostScript goes through ps2pdf; the
+    results land in *workdir* named by *key* (the input's CRC), so a later run
+    finds them there. Returns ``(None, "")`` when *path* is readable as it
+    is, and ``(None, reason)`` when it cannot be made readable.
+    """
+    inner = fmt.removesuffix(".gz")
+    if fmt == inner and inner != "ps":
+        return None, ""
+    final = workdir / f"{key}.{'pdf' if inner == 'ps' else inner}"
+    if final.is_file() and final.stat().st_size > 0:
+        return final, ""
+    src = path
+    if fmt != inner:
+        src = workdir / f"{key}.{inner}"
+        err = _gunzip(path, src)
+        if err:
+            return None, err
+    if inner == "ps":
+        # Bitmap PostScript (scans exported from DjVu) runs to tens of MB and
+        # converts slowly, so the budget grows with the size.
+        mb = src.stat().st_size >> 20
+        err = ps_to_pdf(src, final, timeout=ps_timeout + 20 * mb)
+        if src != path:
+            src.unlink(missing_ok=True)      # the unpacked .ps was only a step
+        if err:
+            return None, err
+    return final, ""
+
+
+def _gunzip(src: Path, dest: Path) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        with gzip.open(src, "rb") as fin, open(tmp, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+    except (OSError, EOFError) as exc:
+        tmp.unlink(missing_ok=True)
+        return f"could not unpack: {exc}"
+    os.replace(tmp, dest)
+    return ""
+
+
+def ps_to_pdf(src: Path, dest: Path, timeout: int = 180) -> str:
+    """Convert PostScript to PDF with ps2pdf; return "" or an error message.
+
+    The PDF is written next to *dest* first and renamed into place, so an
+    interrupted conversion never leaves a truncated file that a later run
+    would take for a finished one.
+    """
+    if dest.is_file() and dest.stat().st_size > 0:
+        return ""
+    if not have("ps2pdf"):
+        return "ps2pdf is not installed"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        p = subprocess.run(["ps2pdf", str(src), str(tmp)], capture_output=True,
+                           timeout=timeout, env=_CHILD_ENV)
+    except subprocess.TimeoutExpired:
+        tmp.unlink(missing_ok=True)
+        return f"ps2pdf timed out after {timeout}s"
+    except OSError as exc:
+        return f"ps2pdf failed: {exc}"
+    if p.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        why = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return "ps2pdf failed" + (f": {why[-1]}" if why else "")
+    os.replace(tmp, dest)
+    return ""
 
 
 # tesseract parallelises internally with OpenMP. With one worker that is a
@@ -436,8 +532,13 @@ def djvu_ocr(path: Path, cfg: Config) -> str:
 
 # --------------------------------------------------------------- entry point
 
-def analyse(path: Path, cfg: Config) -> DocFeatures:
-    """Collect every local signal we can get from one file."""
+def analyse(path: Path, cfg: Config, doc: Path | None = None) -> DocFeatures:
+    """Collect every local signal we can get from one file.
+
+    *doc* is the file actually read when it differs from the input file (the
+    PDF converted from a PostScript original); the name and folder hints
+    still come from *path*.
+    """
     feat = DocFeatures(path=path)
     try:
         feat.size = path.stat().st_size
@@ -446,21 +547,22 @@ def analyse(path: Path, cfg: Config) -> DocFeatures:
         feat.error = f"unreadable: {exc}"
         return feat
 
-    feat.fmt = detect_format(path)
+    src = doc or path
+    feat.fmt = detect_format(src)
     is_djvu = feat.fmt == "djvu"
 
     try:
-        info = djvu_info(path) if is_djvu else pdf_info(path)
+        info = djvu_info(src) if is_djvu else pdf_info(src)
     except Exception as exc:                                    # pragma: no cover
         info, feat.error = {}, f"info failed: {exc}"
     for k, v in (info or {}).items():
         setattr(feat, k, v)
 
     # 1. text layer
-    text = djvu_text(path) if is_djvu else pdf_text(path)
+    text = djvu_text(src) if is_djvu else pdf_text(src)
     # 2. fall back to OCR for scans
     if len(text.strip()) < 220:
-        ocr = djvu_ocr(path, cfg) if is_djvu else ocr_pdf(path, cfg)
+        ocr = djvu_ocr(src, cfg) if is_djvu else ocr_pdf(src, cfg)
         if len(ocr.strip()) > len(text.strip()):
             text, feat.ocr_used = ocr, True
     feat.text = text
@@ -469,7 +571,7 @@ def analyse(path: Path, cfg: Config) -> DocFeatures:
     # 3. layout-aware title/authors (PDF only - DjVu has no bbox extractor)
     if not is_djvu:
         try:
-            feat.page_title, feat.page_authors = extract_title_authors(page_lines(path))
+            feat.page_title, feat.page_authors = extract_title_authors(page_lines(src))
         except Exception:
             pass
     if not feat.page_title and feat.ocr_used:
