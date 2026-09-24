@@ -37,7 +37,7 @@ class Config:
     accept_score: float = 0.86          # auto-accept a metadata match
     review_score: float = 0.70          # below accept: ask the user (if interactive)
     # Politeness / networking.
-    mailto: str = "paper-organizer@example.org"
+    mailto: str = "sinchukss@gmail.com"
     crossref_workers: int = 6
     arxiv_delay: float = 3.0            # arXiv asks for >=3s between queries
     http_timeout: int = 30

@@ -217,14 +217,16 @@ record is the richer one anyway), and at most once per document.
 ### When a registry says "too many requests"
 
 arXiv's documented limit is one request every three seconds over a single
-connection, which the tool keeps to. Beyond that it blocks an address outright
-with HTTP 429 for a cool-off it does not announce (no `Retry-After`; more than
-an hour when it happened here), and every further request keeps the block
-alive. So after three 429s in a row from one host the tool stops asking it and,
-by default, **stops the run** after the lookups already in flight: nothing is
-copied, no question is asked, and `NEW_REPO/.paperorg/RESUME.txt` says what
-happened and gives the command to run again. The exit code is 75 ("try again
-later"), for scripts.
+connection, which the tool keeps to: a rate-limited host gets one request at a
+time, three seconds after the previous answer arrived. Beyond that it blocks an
+address outright with HTTP 429 for a cool-off it does not announce (no
+`Retry-After`; more than an hour when it happened here), and every further
+request keeps the block alive. A longer block comes back as an empty HTTP 406
+on every request, from that address only. So after three 429s in a row from one
+host, or a single 406 or 403, the tool stops asking it and, by default, **stops
+the run** after the lookups already in flight: nothing is copied, no question
+is asked, and `NEW_REPO/.paperorg/RESUME.txt` says what happened and gives the
+command to run again. The exit code is 75 ("try again later"), for scripts.
 
 Resuming is running the same command again. File analyses, registry answers
 and your answers to prompts are all cached, so it continues where it stopped

@@ -17,6 +17,7 @@ import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from typing import Any
 
 import urllib.request
@@ -42,6 +43,11 @@ _NOT_FOUND = {"__not_found__": True}
 # and asking again only prolongs it.
 BLOCK_AFTER_429 = 3
 
+# Statuses that mean the address itself is shut out, so there is nothing to
+# retry: arXiv answers every request with an empty 406 once it has blocked an
+# address, where it first sent 429s.
+BLOCK_STATUSES = {403: "Forbidden", 406: "Not Acceptable"}
+
 
 class Http:
     """Tiny HTTP helper: cache, retries, per-host rate limiting."""
@@ -53,7 +59,8 @@ class Http:
         self._last: dict[str, float] = {}
         self._guard = threading.Lock()
         self._429: dict[str, int] = {}
-        self.blocked: set[str] = set()
+        # Host -> the HTTP status it was given up on for.
+        self.blocked: dict[str, int] = {}
         # Hosts that failed to answer during the current item, per worker
         # thread, so the pipeline can tell "not found" from "not asked".
         self._item = threading.local()
@@ -63,8 +70,14 @@ class Http:
         else:
             self.session = None       # the urllib path below is used instead
 
-    def _throttle(self, host: str, delay: float) -> None:
+    @contextmanager
+    def _turn(self, host: str, delay: float):
+        """Hold *host* for one request, *delay* seconds after the previous
+        one finished. arXiv's terms ask for both: "no more than one request
+        every three seconds" and "a single connection at a time", which
+        spacing out only the starts would break whenever an answer is slow."""
         if delay <= 0:
+            yield
             return
         with self._guard:
             lock = self._locks.setdefault(host, threading.Lock())
@@ -72,7 +85,17 @@ class Http:
             wait = delay - (time.time() - self._last.get(host, 0.0))
             if wait > 0:
                 time.sleep(wait)
-            self._last[host] = time.time()
+            try:
+                yield
+            finally:
+                self._last[host] = time.time()
+
+    def refusals(self) -> str:
+        """``"export.arxiv.org (HTTP 406 Not Acceptable)"``, for every host
+        given up on this run."""
+        return ", ".join(
+            f"{host} (HTTP {st} {BLOCK_STATUSES.get(st, 'Too Many Requests')})"
+            for host, st in sorted(self.blocked.items()))
 
     def begin_item(self) -> None:
         self._item.failed = set()
@@ -123,15 +146,21 @@ class Http:
         body: Any = None
         answered = False
         for attempt in range(self.cfg.retries):
-            self._throttle(host, delay)
             try:
-                status, text = (self.fetch(full, accept) if data is None
-                                else self.fetch(full, accept, data))
+                with self._turn(host, delay):
+                    if host in self.blocked:    # blocked while this one waited
+                        break
+                    status, text = (self.fetch(full, accept) if data is None
+                                    else self.fetch(full, accept, data))
+                if status in BLOCK_STATUSES:
+                    with self._guard:
+                        self.blocked.setdefault(host, status)
+                    break
                 if status == 429:
                     with self._guard:
                         self._429[host] = self._429.get(host, 0) + 1
                         if self._429[host] >= BLOCK_AFTER_429:
-                            self.blocked.add(host)
+                            self.blocked.setdefault(host, 429)
                     if host in self.blocked:
                         break
                 else:

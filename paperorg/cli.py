@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="auto-accept a match at this score (default: 0.86)")
     g.add_argument("--review", type=float, default=0.70, metavar="S",
                    help="ask about matches down to this score (default: 0.70)")
-    g.add_argument("--mailto", default="paper-organizer@example.org",
+    g.add_argument("--mailto", default="sinchukss@gmail.com",
                    help="contact address sent to Crossref's polite pool")
     g.add_argument("--no-cache", action="store_true", help="ignore the cache")
     g.add_argument("--cache", type=Path, help="cache file location")

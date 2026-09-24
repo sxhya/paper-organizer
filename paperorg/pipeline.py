@@ -228,8 +228,8 @@ class Organizer:
         prog.done()
         if stopping and self.http.blocked:
             return False
-        for host in sorted(self.http.blocked):
-            print(f"  {YELLOW}{host} is rate-limiting this machine (HTTP 429); it was "
+        if self.http.blocked:
+            print(f"  {YELLOW}{self.http.refusals()} refused this machine; it was "
                   f"not asked again this run. Re-run later to finish those "
                   f"lookups.{RESET}")
         return True
@@ -250,7 +250,7 @@ class Organizer:
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         self.resume_path.write_text(
             f"paper-organizer stopped at {datetime.now():%Y-%m-%d %H:%M}\n\n"
-            f"{hosts} started refusing requests (HTTP 429 Too Many Requests).\n"
+            f"{self.http.refusals()} started refusing requests.\n"
             f"Looked up {done} of {len(todo)} documents before stopping; nothing\n"
             f"was copied and no questions were asked.\n\n"
             f"Everything done so far is cached. To continue, run the same command\n"
@@ -582,7 +582,7 @@ class Organizer:
         if cfg.online and not self.resolve_all(items):
             self._write_resume(items)
             hosts = ", ".join(sorted(self.http.blocked))
-            print(f"\n  {YELLOW}{hosts} is refusing requests (HTTP 429), so the run "
+            print(f"\n  {YELLOW}{self.http.refusals()} is refusing requests, so the run "
                   f"stops here.{RESET}\n  Progress is cached; see {self.resume_path} "
                   f"for how to continue.")
             return {"interrupted": hosts}

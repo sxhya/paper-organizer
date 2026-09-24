@@ -1,6 +1,8 @@
 """Unit tests for paper-organizer. Run: python3 -m pytest tests/ -q"""
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1062,6 +1064,54 @@ def test_a_rate_limiting_host_is_left_alone_for_the_rest_of_the_run(tmp_path, mo
     assert http.get("https://export.arxiv.org/api/query?q=2") is None
     assert calls["n"] == before, "a blocked host must not be asked again"
     assert http.failed_hosts() == {"export.arxiv.org"}
+
+
+def test_an_outright_block_is_given_up_on_at_once(tmp_path, monkeypatch):
+    from paperorg import sources
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out", retries=3)
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    calls = {"n": 0}
+
+    def banned(url, accept):
+        calls["n"] += 1
+        return (406, "")
+
+    http.fetch = banned
+    http.begin_item()
+    assert http.get("https://export.arxiv.org/api/query?q=1") is None
+    assert calls["n"] == 1, "a block is not retried"
+    assert http.failed_hosts() == {"export.arxiv.org"}, "a block is not 'not found'"
+    assert http.refusals() == "export.arxiv.org (HTTP 406 Not Acceptable)"
+
+
+def test_a_rate_limited_host_gets_one_connection_at_a_time(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    state = {"open": 0, "most": 0}
+    guard = threading.Lock()
+
+    def slow(url, accept):          # answers take longer than the delay
+        with guard:
+            state["open"] += 1
+            state["most"] = max(state["most"], state["open"])
+        time.sleep(0.05)
+        with guard:
+            state["open"] -= 1
+        return (200, "<feed/>")
+
+    http.fetch = slow
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda i: http.get(f"https://export.arxiv.org/api/query?q={i}",
+                                         delay=0.01, parse="text"), range(8)))
+    assert state["most"] == 1
 
 
 def test_a_definite_answer_is_not_a_failed_lookup(tmp_path):
