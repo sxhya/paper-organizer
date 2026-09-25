@@ -13,13 +13,15 @@ from .config import Config, DJVU_EXTS, PDF_EXTS, PS_EXTS, UNSORTED_DIR
 from .dedupe import Item, group_bib_duplicates, group_byte_duplicates, rank_versions
 from .extract import (EXTRACT_VERSION, analyse, detect_format, extract_school, have,
                       name_stem, readable_copy, sniff_format)
+from .arxivguard import Lexicon
+from .arxivplan import ArxivPlan
 from .match import Resolver, parse_author_list
 from .people import (AuthorIndex, plausible_local_title,
                      plausible_person, prefer_richer)
 from .prompts import BOLD, CYAN, DIM, GREEN, RESET, YELLOW, Prompter
 from .record import BibRecord, DocFeatures, DocKind
 from .repo import RepoWriter, plan_placement
-from .util import crc32_file, is_cyrillic
+from .util import crc32_file, is_cyrillic, removesuffix
 from .sources import Arxiv, Crossref, Http, MathNet, OpenLibrary, Zbmath
 
 
@@ -66,9 +68,10 @@ class Organizer:
         self.output_existed = cfg.output_dir.exists()
         self.cache = NullCache() if cfg.cache_path is None else Cache(cfg.cache_path)
         http = self.http = Http(cfg, self.cache)
+        self.plan = ArxivPlan.load(cfg.arxiv_plan_path if cfg.online else None)
         self.resolver = Resolver(cfg, Crossref(http, cfg), Arxiv(http, cfg),
                                  Zbmath(http, cfg), OpenLibrary(http, cfg),
-                                 MathNet(http, cfg))
+                                 MathNet(http, cfg), plan=self.plan)
         self.prompter = Prompter(cfg, self.cache)
         self.writer = RepoWriter(cfg)
         self.stats: dict[str, int] = {}
@@ -108,7 +111,7 @@ class Organizer:
                 self.ignored.append(p)
                 continue
             if p.suffix.lower() not in exts:
-                fmt = sniff_format(p).removesuffix(".gz")
+                fmt = removesuffix(sniff_format(p), ".gz")
                 if not fmt or (fmt == "djvu" and not self.cfg.djvu) \
                         or (fmt == "ps" and not self.cfg.ps):
                     self.ignored.append(p)
@@ -203,8 +206,17 @@ class Organizer:
         registry is refusing to answer (and --on-rate-limit is "stop")."""
         todo = [i for i in items
                 if i.status == "pending" and i.feat_kind is not DocKind.OTHER]
-        prog = Progress(len(todo), "looking up metadata")
         stopping = self.cfg.on_rate_limit == "stop"
+        self.resolver.lexicon = Lexicon.from_cache(self.cache.iter_http())
+        # Identifiers printed in the documents, fifty to an arXiv request
+        # instead of one request each.
+        ids = [i.feat.arxiv_id for i in todo if i.feat.arxiv_id]
+        if ids:
+            sent = self.resolver.arxiv.prefetch(ids)
+            if sent:
+                print(f"  {DIM}looked up {len(set(ids))} arXiv ids in {sent} "
+                      f"request(s){RESET}")
+        prog = Progress(len(todo), "looking up metadata")
 
         # A refusing host is not asked again (Http.blocked), but the lookup
         # carries on: cached answers and the other registries still count,
@@ -226,12 +238,15 @@ class Organizer:
                 it.record, it.candidates = rec, cands
                 prog.step(it.path.name)
         prog.done()
+        self.plan.save()
         if stopping and self.http.blocked:
             return False
         if self.http.blocked:
             print(f"  {YELLOW}{self.http.refusals()} refused this machine; it was "
                   f"not asked again this run. Re-run later to finish those "
                   f"lookups.{RESET}")
+            for host in sorted(self.http.blocked):
+                print(f"  {self.http.retry_after_note(host)}.")
         return True
 
     @property
@@ -246,11 +261,14 @@ class Organizer:
                 if i.status == "pending" and i.feat_kind is not DocKind.OTHER]
         done = sum(1 for i in todo if not i.lookup_failed)
         hosts = ", ".join(sorted(self.http.blocked))
+        notes = "".join(f"  {self.http.retry_after_note(h)}.\n"
+                        for h in sorted(self.http.blocked))
         cmd = shlex.join(sys.argv) if sys.argv and sys.argv[0] else "./organize.py ..."
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         self.resume_path.write_text(
             f"paper-organizer stopped at {datetime.now():%Y-%m-%d %H:%M}\n\n"
             f"{self.http.refusals()} started refusing requests.\n"
+            f"{notes}"
             f"Looked up {done} of {len(todo)} documents before stopping; nothing\n"
             f"was copied and no questions were asked.\n\n"
             f"Everything done so far is cached. To continue, run the same command\n"
@@ -259,6 +277,29 @@ class Organizer:
             f"To finish now without {hosts}, add  --on-rate-limit skip ; the documents\n"
             f"it could not check are tagged [lookup incomplete] in report.txt, and\n"
             f"a later run fills them in.\n", encoding="utf-8")
+
+    def _write_review_note(self, pending: list[str]) -> None:
+        """The run stops so that the arXiv title searches can be checked."""
+        import shlex
+        from datetime import datetime
+        counts = self.plan.counts()
+        cmd = shlex.join(sys.argv) if sys.argv and sys.argv[0] else "./organize.py ..."
+        self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        self.resume_path.write_text(
+            f"paper-organizer stopped at {datetime.now():%Y-%m-%d %H:%M}\n\n"
+            f"{len(pending)} arXiv title searches wait for review in\n\n"
+            f"    {self.cfg.arxiv_plan_path}\n\n"
+            f"({counts.get('y?', 0)} suggested to send, {counts.get('n?', 0)} suggested "
+            f"not to; {counts.get('n', 0)} certain skips are listed too.)\n\n"
+            f"In the first column, replace each y? or n? with y (send) or n (do not).\n"
+            f"The query, title and authors columns can be edited; an empty query is\n"
+            f"rebuilt from title and authors. The scholar column links to a Google\n"
+            f"Scholar search for checking by hand. Then run the same command again:\n\n"
+            f"    {cmd}\n\n"
+            f"Everything else is looked up and cached; nothing was copied and no\n"
+            f"questions were asked. To send the suggestions unchecked, add\n"
+            f"--arxiv-titles auto; to leave arXiv title search out, --arxiv-titles off.\n",
+            encoding="utf-8")
 
     # ------------------------------------------------- 5. human decisions
     def decide(self, items: list[Item]) -> None:
@@ -583,9 +624,19 @@ class Organizer:
             self._write_resume(items)
             hosts = ", ".join(sorted(self.http.blocked))
             print(f"\n  {YELLOW}{self.http.refusals()} is refusing requests, so the run "
-                  f"stops here.{RESET}\n  Progress is cached; see {self.resume_path} "
-                  f"for how to continue.")
+                  f"stops here.{RESET}")
+            for host in sorted(self.http.blocked):
+                print(f"  {self.http.retry_after_note(host)}.")
+            print(f"  Progress is cached; see {self.resume_path} for how to continue.")
             return {"interrupted": hosts}
+        pending = self.plan.pending() if cfg.online and cfg.arxiv_titles == "review" else []
+        if pending:
+            self._write_review_note(pending)
+            print(f"\n  {YELLOW}{len(pending)} arXiv title search(es) wait for your "
+                  f"review, so the run stops here.{RESET}")
+            print(f"  Mark them y or n in {CYAN}{cfg.arxiv_plan_path}{RESET}, then run "
+                  f"the same command again (details in {self.resume_path.name}).")
+            return {"interrupted": "arXiv review"}
         self.decide(items)
         schools = self.fill_thesis_schools(items)
         if schools:
@@ -599,6 +650,7 @@ class Organizer:
         # Report on every input file, including the byte-identical copies that
         # were set aside before classification.
         self.write_outputs(all_items, entries)
+        self.plan.save()
         removed = self.writer.prune_empty()
         self.resume_path.unlink(missing_ok=True)
 

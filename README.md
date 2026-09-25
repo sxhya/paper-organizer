@@ -191,6 +191,9 @@ Things the sample corpus actually contained, and what happens to them:
 --no-mathnet       do not look Cyrillic titles up on Math-Net.Ru
 --on-rate-limit skip   carry on without a registry that refuses requests
                    (default: stop, and resume by running the same command)
+--arxiv-titles auto    send arXiv title searches without review first
+--arxiv-titles off     never search arXiv by title (identifiers still work)
+--arxiv-delay SEC  seconds between arXiv requests (default 30, minimum 3)
 --offline          no network; metadata comes from the files alone
 --no-ocr           never shell out to tesseract
 --ocr-pages 1      OCR only the first page (about twice as fast)
@@ -210,15 +213,48 @@ and passed through tesseract. `--ocr-pages 1` halves that work, `--no-ocr` remov
 it entirely (those files then fall back to their names). Everything is cached,
 so a second run skips all of it.
 
-arXiv asks callers to leave three seconds between queries, so it is consulted
-only when Crossref has not already produced an acceptable match (the Crossref
-record is the richer one anyway), and at most once per document.
+### arXiv: identifiers in batches, title searches after review
+
+arXiv only answers about one request every half minute without blocking the
+address, so it is used sparingly:
+
+* **arXiv ids printed in the documents** are looked up before anything else,
+  fifty to a request (a few minutes for hundreds of ids, not hours).
+* **Title searches** come last, only for documents Crossref, zbMATH and
+  Math-Net.Ru could not identify, and only when the title is worth a query.
+  A single rule set (`paperorg/arxivguard.py`) turns away body text taken
+  for a title, file-name slugs, journal names and running heads, copyright
+  and cover-page stamps, section headings, OCR debris, Russian documents, and
+  papers published before 1992 (the year counts only where a paper states
+  its own date: journal line, copyright, "Received", the file name, a
+  registry record for the same authors; "1991 Mathematics Subject
+  Classification" is a scheme, not a date). A query uses the first author's
+  surname and the title's most distinctive words, e.g.
+  `au:Tate AND ti:symbols AND ti:arithmetic`, not an exact phrase.
+* Some rejected "titles" are better evidence elsewhere and are sent there
+  instead: a JSTOR cover page (its stable id is a DOI, `10.2307/…`), an
+  Elsevier PII, a journal citation line such as `Advances in Mathematics
+  109, 108-139 (1994)` (matched on volume and first page), a Russian title
+  typed in Latin letters (Math-Net.Ru, transliterated back).
+
+By default (`--arxiv-titles review`) the title searches are not sent at
+once. The run looks everything else up, writes every proposed search to
+`NEW_REPO/.paperorg/arxiv-queries.tsv`, and stops before copying or asking
+anything (exit code 75, as for a rate limit). In the first column, replace
+`y?` / `n?` (the suggestions) with `y` or `n`. The query, title and authors
+columns can be edited, and an emptied query is rebuilt from title and
+authors. `passed_over` says why other title candidates were rejected, and
+`scholar` links to a Google Scholar search for checking by hand. Certain
+skips are listed as plain `n`, so they can still be overturned. Then run the
+same command again: it sends the `y` rows, records each outcome in the
+`result` column, and finishes. Rows keep your decisions across runs.
 
 ### When a registry says "too many requests"
 
 arXiv's documented limit is one request every three seconds over a single
-connection, which the tool keeps to: a rate-limited host gets one request at a
-time, three seconds after the previous answer arrived. Beyond that it blocks an
+connection. In practice that pace still drew a block, so the tool leaves 30
+seconds (`--arxiv-delay`, never below 3) after the previous answer arrived,
+over one connection at a time. Beyond that arXiv blocks an
 address outright with HTTP 429 for a cool-off it does not announce (no
 `Retry-After`; more than an hour when it happened here), and every further
 request keeps the block alive. A longer block comes back as an empty HTTP 406
@@ -226,7 +262,11 @@ on every request, from that address only. So after three 429s in a row from one
 host, or a single 406 or 403, the tool stops asking it and, by default, **stops
 the run** after the lookups already in flight: nothing is copied, no question
 is asked, and `NEW_REPO/.paperorg/RESUME.txt` says what happened and gives the
-command to run again. The exit code is 75 ("try again later"), for scripts.
+command to run again. If a registry does send `Retry-After`, the message and
+`RESUME.txt` say when it asked to be tried again. The exit code is 75 ("try
+again later"), for scripts.
+
+The code runs on Python 3.8 and later.
 
 Resuming is running the same command again. File analyses, registry answers
 and your answers to prompts are all cached, so it continues where it stopped

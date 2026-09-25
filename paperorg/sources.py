@@ -10,6 +10,7 @@ Every response goes through the cache, so a second run costs no traffic.
 """
 from __future__ import annotations
 
+import email.utils
 import json
 import re
 import threading
@@ -20,6 +21,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from typing import Any
 
+import urllib.error
 import urllib.request
 
 try:
@@ -61,6 +63,8 @@ class Http:
         self._429: dict[str, int] = {}
         # Host -> the HTTP status it was given up on for.
         self.blocked: dict[str, int] = {}
+        # Host -> (Retry-After header or "", time the refusal arrived)
+        self.retry_after: dict[str, tuple[str, float]] = {}
         # Hosts that failed to answer during the current item, per worker
         # thread, so the pipeline can tell "not found" from "not asked".
         self._item = threading.local()
@@ -97,6 +101,28 @@ class Http:
             f"{host} (HTTP {st} {BLOCK_STATUSES.get(st, 'Too Many Requests')})"
             for host, st in sorted(self.blocked.items()))
 
+    def _note_refusal(self, url: str, status: int, headers: Any) -> None:
+        if status == 429 or status in BLOCK_STATUSES:
+            host = urllib.parse.urlsplit(url).netloc
+            self.retry_after[host] = (((headers or {}).get("Retry-After") or "").strip(),
+                                      time.time())
+
+    def retry_after_note(self, host: str) -> str:
+        """What *host* said about when to try again, in words."""
+        value, when = self.retry_after.get(host, ("", 0.0))
+        if not value:
+            return f"{host} did not say when to retry (no Retry-After header)"
+        if value.isdigit():
+            until = when + int(value)
+        else:
+            try:
+                until = email.utils.parsedate_to_datetime(value).timestamp()
+            except (TypeError, ValueError):
+                return f"{host} sent an unreadable Retry-After: {value!r}"
+        left = max(0, round((until - time.time()) / 60))
+        return (f"{host} asks to retry after {time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}"
+                f" (in about {left} min; Retry-After: {value})")
+
     def begin_item(self) -> None:
         self._item.failed = set()
 
@@ -119,12 +145,35 @@ class Http:
                 r = self.session.post(url, data=form, timeout=self.cfg.http_timeout,
                                       headers={"Accept": accept, "Content-Type":
                                                "application/x-www-form-urlencoded"})
+            self._note_refusal(url, r.status_code, r.headers)
             return r.status_code, r.text
         req = urllib.request.Request(
             url, data=form, headers={"User-Agent": self.cfg.user_agent, "Accept": accept})
-        with urllib.request.urlopen(req, timeout=self.cfg.http_timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.status, resp.read().decode(charset, "replace")
+        try:
+            with urllib.request.urlopen(req, timeout=self.cfg.http_timeout) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                return resp.status, resp.read().decode(charset, "replace")
+        except urllib.error.HTTPError as e:     # urllib raises on 4xx/5xx
+            self._note_refusal(url, e.code, e.headers)
+            return e.code, e.read().decode("utf-8", "replace")
+
+    @staticmethod
+    def cache_key(url: str, params: dict | None = None, parse: str = "json",
+                  form: dict | None = None) -> str:
+        full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+        data = urllib.parse.urlencode(form) if form is not None else ""
+        return f"{parse}:{full}" + (f"#post:{data}" if data else "")
+
+    def is_cached(self, key: str) -> bool:
+        return self.cache.get_http(key) is not None
+
+    def remember(self, key: str, body: Any) -> None:
+        """Store an answer obtained some other way (a batch request) under
+        the key a single request would have used. None means "not found"."""
+        if body is None:
+            self.cache.put_http(key, _NOT_FOUND)
+        else:
+            self.cache.put_http(key, body if isinstance(body, dict) else {"text": body})
 
     def get(self, url: str, params: dict | None = None, *, delay: float = 0.0,
             accept: str = "application/json", parse: str = "json",
@@ -132,7 +181,7 @@ class Http:
         """GET *url* (POST when *form* is given), through the cache."""
         full = url + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
         data = urllib.parse.urlencode(form).encode("ascii") if form is not None else None
-        key = f"{parse}:{full}" + (f"#post:{data.decode()}" if data else "")
+        key = self.cache_key(url, params, parse, form)
         hit = self.cache.get_http(key)
         if hit is not None:
             if hit == _NOT_FOUND:
@@ -265,6 +314,18 @@ class Crossref:
         items = ((data or {}).get("message") or {}).get("items") or []
         return [r for r in (self._to_record(i) for i in items) if r]
 
+    def by_alternative_id(self, alt: str) -> BibRecord | None:
+        """A publisher's own article id, e.g. Elsevier's PII
+        "S0764-4442(01)02061-4" (Crossref stores it without punctuation)."""
+        alt = re.sub(r"[^0-9A-Za-z]", "", alt or "")
+        if not alt:
+            return None
+        data = self.http.get(self.BASE, {"filter": f"alternative-id:{alt}", "rows": 2,
+                                         "select": self.SELECT, "mailto": self.cfg.mailto})
+        items = ((data or {}).get("message") or {}).get("items") or []
+        return self._to_record(items[0]) if len(items) == 1 else None
+
+
     @staticmethod
     def _to_record(m: dict) -> BibRecord | None:
         title = _clean_title(" ".join(m.get("title") or []))
@@ -320,8 +381,57 @@ class Arxiv:
         self.http, self.cfg = http, cfg
 
     def by_id(self, arxiv_id: str) -> BibRecord | None:
-        recs = self._query({"id_list": re.sub(r"v\d+$", "", arxiv_id), "max_results": 1})
+        recs = self._query(self._id_params(arxiv_id))
         return recs[0] if recs else None
+
+    @staticmethod
+    def _id_params(arxiv_id: str) -> dict:
+        return {"id_list": re.sub(r"v\d+$", "", arxiv_id), "max_results": 1}
+
+    def prefetch(self, ids: list[str]) -> int:
+        """Look up many ids in a few requests (50 to a request, where one
+        each would take half a minute apiece), and file every answer under
+        the key `by_id` reads, so the per-document lookups hit the cache.
+        Returns the number of requests made."""
+        wanted = []
+        for i in dict.fromkeys(i for i in ids if i):
+            if not self.http.is_cached(self.http.cache_key(self.BASE, self._id_params(i), "text")):
+                wanted.append(i)
+        sent = 0
+        for start in range(0, len(wanted), 50):
+            chunk = wanted[start:start + 50]
+            ids_only = [re.sub(r"v\d+$", "", i) for i in chunk]
+            text = self.http.get(self.BASE, {"id_list": ",".join(ids_only),
+                                             "max_results": len(chunk)},
+                                 delay=self.cfg.arxiv_delay,
+                                 accept="application/atom+xml", parse="text")
+            sent += 1
+            if not text:
+                continue          # refused or failed: by_id asks one by one
+            try:
+                root = ET.fromstring(text)
+            except ET.ParseError:
+                continue
+            entries = list(root.iter(ATOM + "entry"))
+            if any((e.findtext(ATOM + "title") or "").strip() == "Error" for e in entries):
+                continue          # one malformed id spoils the batch
+            found: dict[str, ET.Element] = {}
+            for e in entries:
+                eid = (e.findtext(ATOM + "id") or "").rsplit("/abs/", 1)[-1]
+                found[_arxiv_key(eid)] = e
+            for asked in chunk:
+                e = found.get(_arxiv_key(asked))
+                key = self.http.cache_key(self.BASE, self._id_params(asked), "text")
+                self.http.remember(key, _single_feed(e) if e is not None else None)
+        return sent
+
+    def search(self, query: str, rows: int = 5) -> list[BibRecord]:
+        """Run an arXiv search_query as given ("au:Tate AND ti:symbols")."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        return self._query({"search_query": query, "max_results": rows})
+
 
     def by_ids(self, ids: list[str]) -> dict[str, BibRecord]:
         """Batch lookup - arXiv accepts a comma separated id_list."""
@@ -358,6 +468,8 @@ class Arxiv:
 
     @staticmethod
     def _to_record(entry: ET.Element) -> BibRecord | None:
+        if (entry.findtext(ATOM + "title") or "").strip() == "Error":
+            return None
         idel = entry.find(ATOM + "id")
         tel = entry.find(ATOM + "title")
         if idel is None or tel is None or not (idel.text or "").strip():
@@ -382,6 +494,21 @@ class Arxiv:
             rec.eprint_class = prim.get("term", "")
         rec.url = f"https://arxiv.org/abs/{rec.arxiv}"
         return rec
+
+
+def _arxiv_key(arxiv_id: str) -> str:
+    """"math.AG/0501234v2" and "math/0501234" are the same paper."""
+    i = re.sub(r"v\d+$", "", (arxiv_id or "").strip().lower())
+    return re.sub(r"^([a-z-]+)\.[a-z]{2}/", r"\1/", i)
+
+
+def _single_feed(entry: ET.Element) -> str:
+    """A one-entry Atom feed, as arXiv would have answered for one id."""
+    ET.register_namespace("", ATOM.strip("{}"))
+    ET.register_namespace("arxiv", ARXIV_NS.strip("{}"))
+    feed = ET.Element(ATOM + "feed")
+    feed.append(entry)
+    return ET.tostring(feed, encoding="unicode")
 
 
 # -------------------------------------------------------------------- zbMATH

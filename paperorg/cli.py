@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--on-rate-limit", choices=("stop", "skip"), default="stop",
                    help="when a registry starts refusing requests: stop and "
                         "resume later (default), or carry on without it")
+    g.add_argument("--arxiv-titles", choices=("review", "auto", "off"), default="review",
+                   help="arXiv title searches: list them in .paperorg/arxiv-queries.tsv "
+                        "and send only the rows you mark y (default), send them "
+                        "as proposed (auto), or never (off)")
+    g.add_argument("--arxiv-delay", type=float, default=30.0, metavar="SEC",
+                   help="seconds between arXiv requests (default: 30; arXiv's "
+                        "own minimum is 3)")
     g.add_argument("--no-mathnet", action="store_true",
                    help="do not look up Cyrillic titles on Math-Net.Ru")
     g.add_argument("--no-zbmath", action="store_true",
@@ -133,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         mailto=args.mailto,
         default_unknown_action=args.unknown,
         on_rate_limit=args.on_rate_limit,
+        arxiv_titles=args.arxiv_titles,
+        arxiv_delay=max(3.0, args.arxiv_delay),
         link_mode=args.links,
         limit=args.limit,
         sample=args.sample,

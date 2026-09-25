@@ -39,12 +39,15 @@ class Config:
     # Politeness / networking.
     mailto: str = "sinchukss@gmail.com"
     crossref_workers: int = 6
-    arxiv_delay: float = 3.0            # arXiv asks for >=3s between queries
+    arxiv_delay: float = 30.0           # arXiv asks for >=3s; 30s keeps clear of its 429 block
     http_timeout: int = 30
     retries: int = 3
     # Behaviour when running without a human.
     default_unknown_action: str = "unsorted"   # unsorted | ignore
     on_rate_limit: str = "stop"                # stop (and resume later) | skip
+    # arXiv title searches: review (listed for a human, sent once marked y) |
+    # auto (sent as proposed) | off (never)
+    arxiv_titles: str = "review"
     link_mode: str = "symlink"                  # symlink | copy | none
     cache_path: Path | None = None
     limit: int | None = None
@@ -68,6 +71,10 @@ class Config:
     @property
     def state_dir(self) -> Path:
         return self.output_dir / ".paperorg"
+
+    @property
+    def arxiv_plan_path(self) -> Path:
+        return self.state_dir / "arxiv-queries.tsv"
 
     @property
     def user_agent(self) -> str:

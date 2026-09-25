@@ -1186,3 +1186,49 @@ def test_msc_goes_to_mrclass_and_keywords():
     text = bibtex.format_entry(rec, "k", "")
     assert re.search(r"mrclass\s*= \{20G35 \(14L15 13D15\)\}", text)
     assert "MSC: 20G35, 14L15, 13D15" in text
+
+
+def test_retry_after_is_reported_in_words(tmp_path):
+    import time as _time
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    host = "export.arxiv.org"
+    assert "did not say when to retry" in http.retry_after_note(host)
+    http.retry_after[host] = ("3600", _time.time())
+    assert "in about 60 min" in http.retry_after_note(host)
+    http.retry_after[host] = ("Wed, 21 Oct 2099 07:28:00 GMT", _time.time())
+    assert "2099-10-21" in http.retry_after_note(host)
+    http.retry_after[host] = ("soon", _time.time())
+    assert "unreadable Retry-After" in http.retry_after_note(host)
+
+
+def test_urllib_refusals_are_statuses_not_exceptions(tmp_path, monkeypatch):
+    """Without requests, urllib raises on 4xx; a 429 must still count as a
+    refusal (and its Retry-After be kept), not as a network hiccup."""
+    import io
+    import urllib.error
+    import urllib.request
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    http.session = None
+
+    def refuse(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests",
+                                     {"Retry-After": "120"}, io.BytesIO(b"slow down"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    assert http.fetch("https://export.arxiv.org/api/query?q=1", "text/xml") == (429, "slow down")
+    assert "in about 2 min" in http.retry_after_note("export.arxiv.org")
+
+
+def test_removesuffix_backport():
+    from paperorg.util import removesuffix
+    assert removesuffix("paper.ps.gz", ".gz") == "paper.ps"
+    assert removesuffix("paper.ps", ".gz") == "paper.ps"
+    assert removesuffix("x", "") == "x"

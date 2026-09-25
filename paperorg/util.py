@@ -18,6 +18,11 @@ _TEX_MACROS = re.compile(r"\\[a-zA-Z]+\s*|[{}$]")
 _WS = re.compile(r"\s+")
 
 
+def removesuffix(s: str, suffix: str) -> str:
+    """``str.removesuffix``, which Python 3.8 lacks."""
+    return s[:-len(suffix)] if suffix and s.endswith(suffix) else s
+
+
 def strip_accents(s: str) -> str:
     return unicodedata.normalize("NFKD", s).translate(_COMBINING)
 

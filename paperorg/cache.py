@@ -70,6 +70,17 @@ class Cache:
     def put_http(self, key: str, value: Any) -> None:
         self._put("http", key, value)
 
+    def iter_http(self):
+        """Every cached HTTP answer, as (key, body); for building a lexicon
+        of what the registries have said so far."""
+        with self._lock:
+            rows = self._conn.execute("SELECT key, body FROM http").fetchall()
+        for key, body in rows:
+            try:
+                yield key, json.loads(body)
+            except json.JSONDecodeError:
+                continue
+
     def get_doc(self, crc: str) -> dict | None:
         return self._get("doc", "payload", crc)
 
@@ -94,6 +105,7 @@ class NullCache(Cache):
         self.ttl = 0
 
     def get_http(self, key): return None
+    def iter_http(self): return iter(())
     def put_http(self, key, value): pass
     def get_doc(self, crc): return None
     def put_doc(self, crc, value): pass

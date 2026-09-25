@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import Config, DJVU_EXTS, OTHER_DOC_EXTS, PDF_EXTS, PS_EXTS
 from .record import DocFeatures
-from .util import crc32_file
+from .util import crc32_file, removesuffix
 
 XHTML = "{http://www.w3.org/1999/xhtml}"
 
@@ -104,7 +104,7 @@ def readable_copy(path: Path, fmt: str, workdir: Path, key: str,
     finds them there. Returns ``(None, "")`` when *path* is readable as it
     is, and ``(None, reason)`` when it cannot be made readable.
     """
-    inner = fmt.removesuffix(".gz")
+    inner = removesuffix(fmt, ".gz")
     if fmt == inner and inner != "ps":
         return None, ""
     final = workdir / f"{key}.{'pdf' if inner == 'ps' else inner}"

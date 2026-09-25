@@ -367,7 +367,7 @@ def test_a_rate_limited_run_stops_and_resumes(tmp_path, monkeypatch):
     from paperorg import sources
     monkeypatch.setattr(sources.time, "sleep", lambda s: None)
     cfg = Config(input_dir=inp, output_dir=out, interactive=False, ocr=False,
-                 jobs=1, crossref_workers=1, retries=3)
+                 jobs=1, crossref_workers=1, retries=3, arxiv_titles="auto")
 
     org = Organizer(cfg)
     org.http.fetch = lambda url, accept, form=None: (429, "")
@@ -390,9 +390,56 @@ def test_skip_mode_finishes_without_the_refusing_registry(tmp_path, monkeypatch)
     from paperorg import sources
     monkeypatch.setattr(sources.time, "sleep", lambda s: None)
     cfg = Config(input_dir=inp, output_dir=out, interactive=False, ocr=False,
-                 retries=3, on_rate_limit="skip")
+                 retries=3, on_rate_limit="skip", arxiv_titles="auto")
     org = Organizer(cfg)
     org.http.fetch = lambda url, accept, form=None: (429, "")
     assert org.run()["placed"] == 1
     assert "lookup incomplete: api.crossref.org" in \
         (cfg.state_dir / "report.txt").read_text(encoding="utf-8")
+
+
+def test_arxiv_title_searches_wait_for_review_then_go_out(tmp_path, monkeypatch):
+    """The first run lists the arXiv searches and stops; once a human marks
+    them, the same command sends exactly those and finishes."""
+    import csv
+    inp, out = tmp_path / "in", tmp_path / "repo"
+    make_pdf(inp / "M. Rost - Norm varieties and algebraic cobordism.pdf",
+             "Norm varieties and algebraic cobordism", "Markus Rost")
+    make_pdf(inp / "A. Suslin - Projective modules over polynomial rings.pdf",
+             "Projective modules over polynomial rings", "Andrei Suslin")
+    from paperorg import sources
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    cfg = Config(input_dir=inp, output_dir=out, interactive=False, ocr=False,
+                 jobs=1, crossref_workers=1, retries=1, arxiv_delay=0)
+    asked = []
+
+    def fetch(url, accept, form=None):
+        if "export.arxiv.org" in url:
+            asked.append(url)
+        return 404, ""
+
+    org = Organizer(cfg)
+    org.http.fetch = fetch
+    stats = org.run()
+    assert stats["interrupted"] == "arXiv review"
+    assert asked == []
+    assert "arxiv-queries.tsv" in (cfg.state_dir / "RESUME.txt").read_text(encoding="utf-8")
+    assert not list(out.rglob("*.pdf"))
+
+    path = cfg.arxiv_plan_path
+    body = [l for l in path.read_text(encoding="utf-8").splitlines(True) if not l.startswith("#")]
+    rows = list(csv.DictReader(body, dialect="excel-tab"))
+    assert {r["send"] for r in rows} == {"y?"}
+    assert any(r["query"].startswith("au:Rost AND ti:") for r in rows)
+    for r in rows:
+        r["send"] = "y" if "Rost" in r["file"] else "n"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]), dialect="excel-tab")
+        w.writeheader()
+        w.writerows(rows)
+
+    again = Organizer(cfg)
+    again.http.fetch = fetch
+    assert again.run()["placed"] == 2
+    assert len(asked) == 1 and "au%3ARost" in asked[0]
+    assert not (cfg.state_dir / "RESUME.txt").exists()

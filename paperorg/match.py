@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .arxivguard import Lexicon, Reroute, decide_arxiv
+from .arxivplan import ArxivPlan
 from .classify import refine_with_metadata
 from .config import Config
 from .extract import name_stem
@@ -107,9 +109,13 @@ class Resolver:
 
     def __init__(self, cfg: Config, crossref: Crossref, arxiv: Arxiv,
                  zbmath: Zbmath, openlib: OpenLibrary,
-                 mathnet: MathNet | None = None) -> None:
+                 mathnet: MathNet | None = None, plan: ArxivPlan | None = None) -> None:
         self.cfg = cfg
         self.mathnet = mathnet
+        # arXiv title searches wait here for a human (see arxivplan).
+        self.plan = plan if plan is not None else ArxivPlan()
+        # What the registries have said so far; the pipeline fills it in.
+        self.lexicon = Lexicon()
         self.crossref = crossref
         self.arxiv = arxiv
         self.zbmath = zbmath
@@ -164,7 +170,6 @@ class Resolver:
         year = self._year_hint(feat)
         seen: set[str] = set()
         out: list[Candidate] = []
-        asked_arxiv = False
 
         for title in titles[:3]:
             key = norm(title)
@@ -187,23 +192,103 @@ class Resolver:
                     out.append(score_candidate(rec, title, hint, year))
             for rec in self.crossref.search(title, hint, rows=5):
                 out.append(score_candidate(rec, title, hint, year))
+            if self._good(out):
+                break
 
-            # arXiv asks callers to wait three seconds between queries, which
-            # dominates the run time, so only fall through to it when Crossref
-            # has not already produced an acceptable match. The Crossref
-            # record is the richer one anyway (journal, volume, pages).
-            if out and max(c.score for c in out) >= self.cfg.accept_score:
-                break
-            # One arXiv query per document, on the best title candidate only:
-            # each costs three seconds of enforced politeness, and the weaker
-            # candidates almost never turn up something the first one missed.
-            if kind in (DocKind.PAPER, DocKind.UNKNOWN) and not asked_arxiv:
-                asked_arxiv = True
-                for rec in self.arxiv.search_title(title, rows=4):
-                    out.append(score_candidate(rec, title, hint, year))
-            if out and max(c.score for c in out) >= self.cfg.accept_score:
-                break
+        # arXiv answers one query every half minute, so it comes last, and
+        # only with a query that survived `decide_arxiv`. The Crossref record
+        # is the richer one anyway (journal, volume, pages).
+        if not self._good(out):
+            self._beyond_titles(feat, kind, titles, hint, year, out)
         return _dedupe(out)
+
+    def _good(self, cands: list[Candidate]) -> bool:
+        return bool(cands) and max(c.score for c in cands) >= self.cfg.accept_score
+
+    # ------------------------------------------------------ arXiv and reroutes
+    def _beyond_titles(self, feat: DocFeatures, kind: DocKind, titles: list[str],
+                       hint: str, year: str, out: list[Candidate]) -> None:
+        dec = decide_arxiv(feat, kind, titles, hint, out, self.lexicon)
+        for r in dec.reroutes:
+            try:
+                out.extend(self._reroute(r, hint, year))
+            except Exception:
+                continue
+            if self._good(out):
+                return
+        if dec.action != "none":
+            self._ask_arxiv(feat, dec, hint, year, out)
+
+    def _reroute(self, r: Reroute, hint: str, year: str) -> list[Candidate]:
+        """Evidence that belongs to a registry other than arXiv."""
+        d = r.data
+        if r.kind == "jstor":
+            # JSTOR's DOIs are its stable ids under the prefix 10.2307.
+            if d.get("stable"):
+                rec = self.crossref.by_doi(f"10.2307/{d['stable']}")
+                if rec and similarity(rec.title, d["title"]) >= 0.6:
+                    return [Candidate(rec, 0.97, 1.0, 0.0, "JSTOR stable id")]
+            return [score_candidate(rec, d["title"], d.get("authors") or hint,
+                                    d.get("year") or year)
+                    for rec in self.crossref.search(d["title"], d.get("authors") or hint)]
+        if r.kind == "pii":
+            rec = self.crossref.by_alternative_id(d["pii"]) \
+                if hasattr(self.crossref, "by_alternative_id") else None
+            # Elsevier's DOIs are their PIIs under 10.1016.
+            rec = rec or self.crossref.by_doi("10.1016/" + d["pii"].lower())
+            return [Candidate(rec, 0.97, 1.0, 0.0, "Elsevier PII")] if rec else []
+        if r.kind == "arxiv-id":
+            rec = self.arxiv.by_id(d["id"])
+            return [Candidate(rec, 0.97, 1.0, 0.0, "arXiv stamp")] if rec else []
+        if r.kind == "citation":
+            return [score_citation(rec, d, hint)
+                    for rec in self.crossref.search(d["line"], hint, rows=5)]
+        if r.kind == "mathnet" and self.mathnet:
+            return [score_candidate(rec, d["title"], d.get("author") or hint, year)
+                    for rec in self._mathnet_search(d["title"], d.get("author", ""))]
+        return []
+
+    def _plan_key(self, feat: DocFeatures) -> str:
+        try:
+            return str(feat.path.relative_to(self.cfg.input_dir))
+        except ValueError:
+            return str(feat.path)
+
+    def _ask_arxiv(self, feat: DocFeatures, dec, hint: str, year: str,
+                   out: list[Candidate]) -> None:
+        """Send the query a human approved (or, with --arxiv-titles auto,
+        the one `decide_arxiv` proposed); otherwise just put it on the list."""
+        mode = getattr(self.cfg, "arxiv_titles", "review")
+        if mode == "off":
+            return
+        key = self._plan_key(feat)
+        row = self.plan.reviewed(key)
+        self.plan.propose(key, dec)
+        if row is not None:
+            if row["send"].lower() not in ("y", "yes"):
+                return
+            query = self.plan.query_for(row)
+            title, who = row["title"] or dec.title, row["authors"] or hint
+        elif mode == "auto" and dec.action == "send":
+            query, title, who = dec.query, dec.title, hint
+        else:
+            return
+        if not query:
+            self.plan.note_result(key, "nothing to send: no query and no title words")
+            return
+        recs = self.arxiv.search(query, rows=5)
+        cands = [score_candidate(rec, title, who, year) for rec in recs]
+        out.extend(cands)
+        http = getattr(self.arxiv, "http", None)
+        if not recs and http is not None and "export.arxiv.org" in http.failed_hosts():
+            self.plan.note_result(key, "not answered (arXiv refusing); sent again next run")
+        elif not cands:
+            self.plan.note_result(key, "no results")
+        else:
+            best = max(cands, key=lambda c: c.score)
+            verdict = "accepted" if best.score >= self.cfg.accept_score else "best only"
+            self.plan.note_result(key, f"{verdict} {best.score:.2f}: {best.record.title[:70]}"
+                                       f" (arXiv:{best.record.arxiv})")
 
     def _mathnet_search(self, title: str, hint: str) -> list[BibRecord]:
         """Every word must match on Math-Net.Ru, so one OCR slip or a
@@ -283,6 +368,33 @@ class Resolver:
         m = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", feat.text[:2000])
         rec.year = m.group(1) if m else ""
         return rec
+
+
+def score_citation(rec: BibRecord, cite: dict, author_hint: str = "") -> Candidate:
+    """How well *rec* fits a printed reference line: journal, volume and
+    first page all agreeing is as good as an identifier."""
+    score, why = 0.45, []
+    fp = re.split(r"\D+", rec.pages or "")[0] if rec.pages else ""
+    if cite.get("volume") and str(rec.volume) == cite["volume"]:
+        score += 0.2
+        why.append("volume")
+    if cite.get("page") and fp == cite["page"]:
+        score += 0.2
+        why.append("page")
+    j, want = norm(rec.journal), norm(cite.get("journal", ""))
+    if j and want and (similarity(j, want) >= 0.6 or j in want or want in j):
+        score += 0.1
+        why.append("journal")
+    if cite.get("year") and rec.year == cite["year"]:
+        score += 0.05
+        why.append("year")
+    ascore = author_agreement(rec, author_hint)
+    if ascore:
+        score += 0.05 * ascore
+    if "volume" not in why or "page" not in why:
+        score = min(score, 0.75)        # a journal and a year are not enough
+    return Candidate(rec, min(1.0, score), 0.0, ascore,
+                     "citation line: " + (", ".join(why) or "nothing agrees"))
 
 
 def _first_surname(hint: str) -> str:

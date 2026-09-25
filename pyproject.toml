@@ -2,7 +2,7 @@
 name = "paper-organizer"
 version = "1.0.0"
 description = "Build a tidy, BibTeX-indexed repository from a pile of unsorted mathematical PDFs"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 dependencies = ["requests>=2.25"]
 
 [project.optional-dependencies]
