@@ -51,6 +51,43 @@ BLOCK_AFTER_429 = 3
 BLOCK_STATUSES = {403: "Forbidden", 406: "Not Acceptable"}
 
 
+class _Pace:
+    """At most *concurrency* requests in flight, their starts at least
+    1/*rate* seconds apart. Both can only tighten, when the host says so."""
+
+    def __init__(self, rate: float, concurrency: int) -> None:
+        self.interval = 1.0 / rate if rate > 0 else 0.0
+        self.concurrency = max(1, concurrency)
+        self._in_flight = 0
+        self._next = 0.0
+        self._cv = threading.Condition()
+
+    def tighten(self, rate: float = 0.0, concurrency: int = 0) -> None:
+        with self._cv:
+            if rate > 0:
+                self.interval = max(self.interval, 1.0 / rate)
+            if concurrency > 0:
+                self.concurrency = min(self.concurrency, concurrency)
+
+    @contextmanager
+    def turn(self):
+        with self._cv:
+            while self._in_flight >= self.concurrency:
+                self._cv.wait()
+            self._in_flight += 1
+            now = time.time()
+            start = max(now, self._next)
+            self._next = start + self.interval
+        try:
+            if start > now:
+                time.sleep(start - now)
+            yield
+        finally:
+            with self._cv:
+                self._in_flight -= 1
+                self._cv.notify()
+
+
 class Http:
     """Tiny HTTP helper: cache, retries, per-host rate limiting."""
 
@@ -65,6 +102,12 @@ class Http:
         self.blocked: dict[str, int] = {}
         # Host -> (Retry-After header or "", time the refusal arrived)
         self.retry_after: dict[str, tuple[str, float]] = {}
+        # Hosts that publish a request budget. Crossref's polite pool allows
+        # 3 searches a second, 3 at a time, and says so in its headers
+        # (X-Rate-Limit-Limit, X-Rate-Limit-Interval, X-Concurrency-Limit);
+        # six workers with no pause drew a 429 within two minutes.
+        self.pace: dict[str, _Pace] = {
+            "api.crossref.org": _Pace(cfg.crossref_rate, cfg.crossref_concurrency)}
         # Hosts that failed to answer during the current item, per worker
         # thread, so the pipeline can tell "not found" from "not asked".
         self._item = threading.local()
@@ -100,6 +143,19 @@ class Http:
         return ", ".join(
             f"{host} (HTTP {st} {BLOCK_STATUSES.get(st, 'Too Many Requests')})"
             for host, st in sorted(self.blocked.items()))
+
+    def _note_limits(self, url: str, headers: Any) -> None:
+        """Tighten a paced host to the budget it advertises."""
+        pace = self.pace.get(urllib.parse.urlsplit(url).netloc)
+        if pace is None or not headers:
+            return
+        try:
+            limit = int(headers.get("X-Rate-Limit-Limit") or 0)
+            interval = float((headers.get("X-Rate-Limit-Interval") or "1s").rstrip("s") or 1)
+            conc = int(headers.get("X-Concurrency-Limit") or 0)
+        except (TypeError, ValueError):
+            return
+        pace.tighten(limit / interval if limit and interval > 0 else 0.0, conc)
 
     def _note_refusal(self, url: str, status: int, headers: Any) -> None:
         if status == 429 or status in BLOCK_STATUSES:
@@ -146,11 +202,13 @@ class Http:
                                       headers={"Accept": accept, "Content-Type":
                                                "application/x-www-form-urlencoded"})
             self._note_refusal(url, r.status_code, r.headers)
+            self._note_limits(url, r.headers)
             return r.status_code, r.text
         req = urllib.request.Request(
             url, data=form, headers={"User-Agent": self.cfg.user_agent, "Accept": accept})
         try:
             with urllib.request.urlopen(req, timeout=self.cfg.http_timeout) as resp:
+                self._note_limits(url, resp.headers)
                 charset = resp.headers.get_content_charset() or "utf-8"
                 return resp.status, resp.read().decode(charset, "replace")
         except urllib.error.HTTPError as e:     # urllib raises on 4xx/5xx
@@ -196,7 +254,8 @@ class Http:
         answered = False
         for attempt in range(self.cfg.retries):
             try:
-                with self._turn(host, delay):
+                pace = self.pace.get(host)
+                with (pace.turn() if pace is not None else self._turn(host, delay)):
                     if host in self.blocked:    # blocked while this one waited
                         break
                     status, text = (self.fetch(full, accept) if data is None

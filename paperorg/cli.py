@@ -67,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--arxiv-delay", type=float, default=30.0, metavar="SEC",
                    help="seconds between arXiv requests (default: 30; arXiv's "
                         "own minimum is 3)")
+    g.add_argument("--crossref-rate", type=float, default=2.5, metavar="N",
+                   help="Crossref requests per second, at most 3 at a time "
+                        "(default: 2.5; Crossref allows 3)")
     g.add_argument("--no-mathnet", action="store_true",
                    help="do not look up Cyrillic titles on Math-Net.Ru")
     g.add_argument("--no-zbmath", action="store_true",
@@ -142,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         on_rate_limit=args.on_rate_limit,
         arxiv_titles=args.arxiv_titles,
         arxiv_delay=max(3.0, args.arxiv_delay),
+        crossref_rate=max(0.1, args.crossref_rate),
         link_mode=args.links,
         limit=args.limit,
         sample=args.sample,

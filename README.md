@@ -194,6 +194,7 @@ Things the sample corpus actually contained, and what happens to them:
 --arxiv-titles auto    send arXiv title searches without review first
 --arxiv-titles off     never search arXiv by title (identifiers still work)
 --arxiv-delay SEC  seconds between arXiv requests (default 30, minimum 3)
+--crossref-rate N  Crossref requests per second, 3 at a time (default 2.5)
 --offline          no network; metadata comes from the files alone
 --no-ocr           never shell out to tesseract
 --ocr-pages 1      OCR only the first page (about twice as fast)
@@ -262,7 +263,11 @@ on every request, from that address only. So after three 429s in a row from one
 host, or a single 406 or 403, the tool stops asking it and, by default, **stops
 the run** after the lookups already in flight: nothing is copied, no question
 is asked, and `NEW_REPO/.paperorg/RESUME.txt` says what happened and gives the
-command to run again. If a registry does send `Retry-After`, the message and
+command to run again. Crossref publishes its budget in its response headers: in the polite pool
+(the tool's User-Agent carries the `--mailto` address) 3 searches a second
+and 3 requests at a time. The tool keeps under it (2.5 a second by default,
+never more than 3 in flight) and tightens further if the headers ask for
+less. If a registry does send `Retry-After`, the message and
 `RESUME.txt` say when it asked to be tried again. The exit code is 75 ("try
 again later"), for scripts.
 

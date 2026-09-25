@@ -39,6 +39,8 @@ class Config:
     # Politeness / networking.
     mailto: str = "sinchukss@gmail.com"
     crossref_workers: int = 6
+    crossref_rate: float = 2.5          # requests/s; Crossref's polite pool allows 3
+    crossref_concurrency: int = 3       # requests in flight at once, as Crossref asks
     arxiv_delay: float = 30.0           # arXiv asks for >=3s; 30s keeps clear of its 429 block
     http_timeout: int = 30
     retries: int = 3

@@ -1232,3 +1232,49 @@ def test_removesuffix_backport():
     assert removesuffix("paper.ps.gz", ".gz") == "paper.ps"
     assert removesuffix("paper.ps", ".gz") == "paper.ps"
     assert removesuffix("x", "") == "x"
+
+
+def test_crossref_is_paced_and_capped(tmp_path):
+    """Crossref's polite pool: 3 requests a second, 3 at a time."""
+    from concurrent.futures import ThreadPoolExecutor
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out",
+                 crossref_rate=20, crossref_concurrency=3)
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    state = {"open": 0, "most": 0, "starts": []}
+    guard = threading.Lock()
+
+    def slow(url, accept, form=None):
+        with guard:
+            state["open"] += 1
+            state["most"] = max(state["most"], state["open"])
+            state["starts"].append(time.time())
+        time.sleep(0.2)                  # slower than the spacing, so they pile up
+        with guard:
+            state["open"] -= 1
+        return 200, '{"message": {"items": []}}'
+
+    http.fetch = slow
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: http.get("https://api.crossref.org/works", {"q": i}), range(12)))
+    starts = sorted(state["starts"])
+    assert state["most"] == 3
+    assert min(b - a for a, b in zip(starts, starts[1:])) >= 0.045   # 1/20 s apart
+
+
+def test_crossref_pace_follows_its_headers(tmp_path):
+    from paperorg.cache import Cache
+    from paperorg.sources import Http
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out", crossref_rate=5)
+    http = Http(cfg, Cache(tmp_path / "c.sqlite3"))
+    pace = http.pace["api.crossref.org"]
+    http._note_limits("https://api.crossref.org/works?q=x",
+                      {"X-Rate-Limit-Limit": "2", "X-Rate-Limit-Interval": "1s",
+                       "X-Concurrency-Limit": "1"})
+    assert (round(pace.interval, 2), pace.concurrency) == (0.5, 1)
+    http._note_limits("https://api.crossref.org/works?q=y",
+                      {"X-Rate-Limit-Limit": "50", "X-Rate-Limit-Interval": "1s"})
+    assert round(pace.interval, 2) == 0.5          # never loosens
