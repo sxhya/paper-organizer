@@ -31,6 +31,25 @@ def _tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+def _prepare_stdin() -> None:
+    """Make typed answers survive stray non-UTF-8 bytes.
+
+    Without line editing, backspacing over a multi-byte character can leave a
+    lone lead byte (e.g. 0xc2) in the line, and a strict decoder then raises
+    UnicodeDecodeError out of input(). readline gives proper editing; the
+    'replace' error handler turns anything left over into U+FFFD, which simply
+    fails validation and re-prompts.
+    """
+    try:
+        import readline  # noqa: F401  (side effect: line editing for input())
+    except ImportError:
+        pass
+    try:
+        sys.stdin.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 class Prompter:
     """Asks the user; remembers answers so a resumed run stays quiet."""
 
@@ -41,6 +60,8 @@ class Prompter:
         self.cache = cache
         self.enabled = cfg.interactive and _tty()
         self.apply_all: dict[str, str] = {}
+        if self.enabled:
+            _prepare_stdin()
 
     # ------------------------------------------------------------------ core
     def _ask(self, question: str, options: list[tuple[str, str]],
@@ -67,6 +88,9 @@ class Prompter:
             except (EOFError, KeyboardInterrupt):
                 print()
                 return default
+            except UnicodeDecodeError:
+                print(f"  {YELLOW}could not read that input; please try again{RESET}")
+                continue
             if not raw:
                 choice = default
             else:
