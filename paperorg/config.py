@@ -79,6 +79,10 @@ class Config:
         return self.state_dir / "arxiv-queries.tsv"
 
     @property
+    def overrides_path(self) -> Path:
+        return self.state_dir / "overrides.tsv"
+
+    @property
     def user_agent(self) -> str:
         from . import __version__
         return f"paper-organizer/{__version__} (mailto:{self.mailto})"

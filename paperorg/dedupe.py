@@ -34,6 +34,7 @@ class Item:
     placement: object | None = None
     duplicates: list[Path] = field(default_factory=list)   # byte-identical twins
     lookup_failed: list[str] = field(default_factory=list) # hosts that did not answer
+    override: bool = False                 # record pinned in overrides.tsv
 
     @property
     def path(self) -> Path:

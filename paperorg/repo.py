@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,6 +114,10 @@ class RepoWriter:
         if not self.cfg.dry_run:
             if crc and self._same_document(dest, crc):
                 reused = True
+            elif crc and (twin := self._numbered_twin(dest, crc)):
+                # "Title.pdf" belongs to another document; an earlier run put
+                # this one at "Title (3).pdf", so that is where it still is.
+                dest, reused = twin, True
             else:
                 dest = unique_path(dest)
         primary_rel = dest.relative_to(self.root)
@@ -160,6 +165,20 @@ class RepoWriter:
             return crc32_file(dest) == crc
         except OSError:
             return False
+
+    @classmethod
+    def _numbered_twin(cls, dest: Path, crc: str) -> Path | None:
+        """The ``dest (N)`` sibling already holding this document, if any.
+
+        Only consulted while *dest* itself is taken: a free clean name is
+        always preferred to a numbered one.
+        """
+        if not dest.is_file() or not dest.parent.is_dir():
+            return None
+        pattern = re.compile(re.escape(dest.stem) + r" \((\d+)\)" + re.escape(dest.suffix))
+        twins = sorted((int(m.group(1)), dest.parent / m.group(0))
+                       for m in map(pattern.fullmatch, os.listdir(dest.parent)) if m)
+        return next((p for _, p in twins if cls._same_document(p, crc)), None)
 
     def _make_link(self, target: Path, link: Path) -> None:
         """Relative symlink so the whole repository stays movable."""

@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from . import bibtex
+from . import bibtex, overrides
 from .cache import Cache, NullCache
 from .classify import classify
 from .config import Config, DJVU_EXTS, PDF_EXTS, PS_EXTS, UNSORTED_DIR
@@ -302,10 +302,37 @@ class Organizer:
             encoding="utf-8")
 
     # ------------------------------------------------- 5. human decisions
+    def apply_overrides(self, items: list[Item]) -> int:
+        """Pin the records listed in overrides.tsv; return how many applied."""
+        rows = overrides.load(self.cfg.overrides_path)
+        if not rows:
+            return 0
+        applied = 0
+        for it in items:
+            row = rows.pop(str(it.path.relative_to(self.cfg.input_dir)), None)
+            if row is None or it.status != "pending":
+                continue
+            fetched = None
+            if self.cfg.online and row.get("doi"):
+                fetched = self.resolver.crossref.by_doi(row["doi"])
+            elif self.cfg.online and row.get("arxiv"):
+                fetched = self.resolver.arxiv.by_id(row["arxiv"])
+            if fetched:
+                self.resolver.finish(fetched, it.feat_kind)
+            # The row's own fields (kind included) have the last word.
+            rec = overrides.build(row, fetched, parse_author_list)
+            it.record, it.candidates = rec, []
+            it.feat_kind, it.override = rec.kind, True
+            it.note = "record set in overrides.tsv"
+            applied += 1
+        for rel in rows:
+            print(f"  {YELLOW}overrides.tsv: no pending document at {rel}{RESET}")
+        return applied
+
     def decide(self, items: list[Item]) -> None:
         # 5a. things we could not classify as scholarly output
         for it in items:
-            if it.status != "pending":
+            if it.status != "pending" or it.override:
                 continue
             if it.feat_kind is DocKind.OTHER or (it.record is None and not it.candidates
                                                  and it.feat_kind is DocKind.UNKNOWN):
@@ -330,7 +357,7 @@ class Organizer:
 
         # 5b. uncertain matches
         for it in items:
-            if it.status != "pending" or it.record is not None:
+            if it.status != "pending" or it.record is not None or it.override:
                 continue
             chosen = self.prompter.confirm_match(it, it.candidates)
             if chosen:
@@ -637,6 +664,10 @@ class Organizer:
             print(f"  Mark them y or n in {CYAN}{cfg.arxiv_plan_path}{RESET}, then run "
                   f"the same command again (details in {self.resume_path.name}).")
             return {"interrupted": "arXiv review"}
+        pinned = self.apply_overrides(items)
+        if pinned:
+            print(f"  {DIM}took {pinned} record(s) from "
+                  f"{cfg.overrides_path.name}{RESET}")
         self.decide(items)
         schools = self.fill_thesis_schools(items)
         if schools:
