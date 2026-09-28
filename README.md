@@ -179,6 +179,45 @@ Things the sample corpus actually contained, and what happens to them:
   they have a real text layer, and you choose. The default offered first is the
   one with a genuine text layer and the most pages.
 
+Sometimes the files in such a group are *not* the same work: a thesis matched
+to the author's paper of a similar title, part II matched to part I, a DOI
+cited on the first page taken for the document's own. Keeping or dropping
+cannot fix that, so `NEW_REPO/.paperorg/overrides.tsv` pins the record of
+single files. It is tab-separated with a header line; `file` (relative to the
+input folder) is required, and `kind`, `doi`, `arxiv`, `title`, `authors`
+(separated by `;`), `year`, `journal`, `volume`, `number`, `pages`, `school`,
+`thesis_type` (BibTeX `type`, e.g. `Undergraduate thesis`), `language` and
+`note` are optional:
+
+```
+file	kind	doi	title	authors	year	school
+[theses]/V. Petrov - Overgroups of classical groups.pdf	thesis		Надгруппы классических групп	Viktor Petrov	2005	St. Petersburg State University
+08 - Asymptotics/M. Liebeck et al. - Product decompositions.pdf		10.1112/blms/bdr107
+```
+
+A `doi` or `arxiv` is looked up and the other columns win over what it
+returns; a row without either is filed from its own columns. A pinned file is
+never asked about, and `kind` = `ignore` leaves the file out of the repository
+altogether. Because version answers are remembered by the entry they
+were given for, delete the stale `version:` answers from the cache's
+`decision` table when an override changes which files share an entry.
+
+Some spellings of one person are beyond the automatic merge: another script
+(`Вавилов` / `Vavilov`), a romanisation (`Victor` / `Viktor`), a middle name
+used as the first name, a registry typo. `NEW_REPO/.paperorg/authors.tsv` maps
+each such variant, written as its folder name, to the name to use instead:
+
+```
+variant	canonical
+Вавилов, Николай	Vavilov, Nikolai
+Vavilov, N. A	Vavilov, Nikolai
+Hai, Bui Xuan	Bui, Xuan Hai
+```
+
+It applies to every document after the automatic merge, so list only true
+variants of one person; a junk "author" standing for different people in
+different files belongs in `overrides.tsv`.
+
 ## Options
 
 ```

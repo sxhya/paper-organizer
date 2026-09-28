@@ -332,6 +332,117 @@ def test_unique_path(tmp_path):
     assert unique_path(p).name == "a (2).pdf"
 
 
+def test_rerun_finds_a_document_at_its_numbered_name(tmp_path):
+    # Two papers with one title share a folder: the second is "T (2).pdf".
+    # A second run used to copy it again to "T (3).pdf" every time.
+    from paperorg.repo import Placement, RepoWriter
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    a, b = tmp_path / "a.pdf", tmp_path / "b.pdf"
+    a.write_bytes(b"first paper")
+    b.write_bytes(b"second paper")
+    where = Placement(Path("Serre, Jean-Pierre") / "Groupes algebriques.pdf")
+    for _ in range(2):
+        w = RepoWriter(cfg)
+        got = [w.place(src, where, crc=crc32_file(src)).primary.name for src in (a, b)]
+        assert got == ["Groupes algebriques.pdf", "Groupes algebriques (2).pdf"]
+    assert len(list((cfg.output_dir / "Serre, Jean-Pierre").iterdir())) == 2
+    assert w.reused == [Path("Serre, Jean-Pierre") / n for n in got]
+    # A free clean name still wins over a numbered copy.
+    (cfg.output_dir / where.primary).unlink()
+    assert RepoWriter(cfg).place(b, where, crc=crc32_file(b)).primary == where.primary
+
+
+def test_rerun_finds_a_coauthor_link_at_its_numbered_name(tmp_path):
+    # Stavrova's own preprint and her paper with Luzgarev share a title, so
+    # her link to the joint paper is "T (2).pdf"; re-runs kept adding "(3)".
+    from paperorg.repo import Placement, RepoWriter
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    own, joint = tmp_path / "own.pdf", tmp_path / "joint.pdf"
+    own.write_bytes(b"single-author preprint")
+    joint.write_bytes(b"joint paper")
+    title = "Elementary subgroup is perfect.pdf"
+    mine = Placement(Path("Stavrova, Anastasia") / title)
+    ours = Placement(Path("Luzgarev, Alexander Yu") / title, [Path("Stavrova, Anastasia") / title])
+    for _ in range(3):
+        w = RepoWriter(cfg)
+        w.place(own, mine, crc=crc32_file(own))
+        got = w.place(joint, ours, crc=crc32_file(joint))
+        assert got.links == [Path("Stavrova, Anastasia") / "Elementary subgroup is perfect (2).pdf"]
+    assert sorted(p.name for p in (cfg.output_dir / "Stavrova, Anastasia").iterdir()) == [
+        "Elementary subgroup is perfect (2).pdf", title]
+
+
+def test_author_aliases_join_variants_the_merge_cannot(tmp_path):
+    # Another script, a typo and a bare initial: three folders for one man.
+    from paperorg import aliases
+
+    path = tmp_path / "authors.tsv"
+    path.write_text("# one person\nvariant\tcanonical\n"
+                    "Вавилов, Николай\tVavilov, Nikolai\n"
+                    "Vavilov, Nikoli\tVavilov, Nikolai\n"
+                    "Vavilov, N. A.\tVavilov, Nikolai\n"
+                    "N.Vavilov\tVavilov, Nikolai\n", encoding="utf-8")
+    table = aliases.load(path)
+    recs = [BibRecord(title="a", authors=[Author("Вавилов", "Николай")]),
+            BibRecord(title="b", authors=[Author("Vavilov", "N. A."), Author("Plotkin", "Eugene"),
+                                          Author("Vavilov", "Nikoli")]),
+            BibRecord(title="c", authors=[Author(literal="N.Vavilov")])]
+    assert aliases.apply(table, recs) == 4
+    assert [[author_folder(a) for a in r.authors] for r in recs] == [
+        ["Vavilov, Nikolai"], ["Vavilov, Nikolai", "Plotkin, Eugene"], ["Vavilov, Nikolai"]]
+    assert aliases.load(tmp_path / "absent.tsv") == {}
+
+
+def test_overrides_can_leave_a_file_out(tmp_path):
+    from paperorg.pipeline import Organizer
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out",
+                 online=False, interactive=False)
+    leaflet = _item(cfg.input_dir, "Kindergeld_Merkblatt.pdf", b"leaflet")
+    leaflet.record = BibRecord(kind=DocKind.PAPER, title="Kindergeld")
+    cfg.state_dir.mkdir(parents=True)
+    cfg.overrides_path.write_text("file\tkind\nKindergeld_Merkblatt.pdf\tignore\n",
+                                  encoding="utf-8")
+    assert Organizer(cfg).apply_overrides([leaflet]) == 1
+    assert (leaflet.status, leaflet.note) == ("skipped", "ignored in overrides.tsv")
+
+
+def test_overrides_pin_a_record_and_split_a_false_version_group(tmp_path):
+    # The corpus case: a Russian thesis matched to the author's paper of a
+    # similar title, so the version prompt could only keep one of the two.
+    from paperorg.pipeline import Organizer
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out",
+                 online=False, interactive=False)
+    paper = _item(cfg.input_dir, "V. Petrov - Overgroups of unitary groups.pdf", b"paper")
+    thesis = _item(cfg.input_dir, "thesis.pdf", b"thesis", sub="theses")
+    for it in (paper, thesis):
+        it.feat_kind = DocKind.PAPER
+        it.record = BibRecord(kind=DocKind.PAPER, title="Overgroups of unitary groups",
+                              doi="10.1023/B:KTHE.0000006934.95243.91")
+    assert len(group_bib_duplicates([paper, thesis])) == 1
+    cfg.state_dir.mkdir(parents=True)
+    cfg.overrides_path.write_text(
+        "# corrections\n"
+        "file\tkind\ttitle\tauthors\tyear\tschool\n"
+        "theses/thesis.pdf\tthesis\tНадгруппы классических групп\tViktor Petrov\t2005"
+        "\tSt. Petersburg State University\n"
+        "gone/missing.pdf\tpaper\tNot in the input\t\t\t\n", encoding="utf-8")
+
+    org = Organizer(cfg)
+    assert org.apply_overrides([paper, thesis]) == 1
+    rec = thesis.record
+    assert thesis.override and rec.kind is DocKind.THESIS and rec.source == "override"
+    assert (rec.title, rec.year, rec.doi) == ("Надгруппы классических групп", "2005", "")
+    assert [a.family for a in rec.authors] == ["Petrov"]
+    assert group_bib_duplicates([paper, thesis]) == {}
+    org.decide([paper, thesis])                  # never asked, never replaced
+    assert thesis.record is rec
+    assert plan_placement(rec, ".pdf").primary.parts[0] == "Thesis"
+
+
 # ------------------------------------------------------------------- config
 
 def test_config_resolves_paths(tmp_path):

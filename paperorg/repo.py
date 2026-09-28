@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,6 +114,10 @@ class RepoWriter:
         if not self.cfg.dry_run:
             if crc and self._same_document(dest, crc):
                 reused = True
+            elif crc and (twin := self._numbered_twin(dest, crc)):
+                # "Title.pdf" belongs to another document; an earlier run put
+                # this one at "Title (3).pdf", so that is where it still is.
+                dest, reused = twin, True
             else:
                 dest = unique_path(dest)
         primary_rel = dest.relative_to(self.root)
@@ -136,7 +141,11 @@ class RepoWriter:
                     # where we want it; replacing it in place beats adding a
                     # "(2)" twin next to it.
                     if not self._points_at(link_path, dest):
-                        link_path = unique_path(link_path)
+                        # The same, for a link numbered because its name was
+                        # taken: find it rather than add "(3)" beside "(2)".
+                        twin = next((q for q in self._numbered_siblings(link_path)
+                                     if self._points_at(q, dest)), None)
+                        link_path = twin or unique_path(link_path)
                     self._make_link(dest, link_path)
                 links.append(link_path.relative_to(self.root))
                 self.linked.append(link_path.relative_to(self.root))
@@ -160,6 +169,26 @@ class RepoWriter:
             return crc32_file(dest) == crc
         except OSError:
             return False
+
+    @staticmethod
+    def _numbered_siblings(path: Path) -> list[Path]:
+        """``path (2)``, ``path (3)``, ... as they exist on disk, in order.
+
+        Empty while *path* itself is free: a free clean name is always
+        preferred to a numbered one.
+        """
+        if not (path.exists() or path.is_symlink()) or not path.parent.is_dir():
+            return []
+        pattern = re.compile(re.escape(path.stem) + r" \((\d+)\)" + re.escape(path.suffix))
+        found = sorted((int(m.group(1)), path.parent / m.group(0))
+                       for m in map(pattern.fullmatch, os.listdir(path.parent)) if m)
+        return [p for _, p in found]
+
+    @classmethod
+    def _numbered_twin(cls, dest: Path, crc: str) -> Path | None:
+        """The ``dest (N)`` sibling already holding this document, if any."""
+        return next((p for p in cls._numbered_siblings(dest)
+                     if cls._same_document(p, crc)), None)
 
     def _make_link(self, target: Path, link: Path) -> None:
         """Relative symlink so the whole repository stays movable."""
