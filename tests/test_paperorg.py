@@ -353,6 +353,62 @@ def test_rerun_finds_a_document_at_its_numbered_name(tmp_path):
     assert RepoWriter(cfg).place(b, where, crc=crc32_file(b)).primary == where.primary
 
 
+def test_rerun_finds_a_coauthor_link_at_its_numbered_name(tmp_path):
+    # Stavrova's own preprint and her paper with Luzgarev share a title, so
+    # her link to the joint paper is "T (2).pdf"; re-runs kept adding "(3)".
+    from paperorg.repo import Placement, RepoWriter
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out")
+    own, joint = tmp_path / "own.pdf", tmp_path / "joint.pdf"
+    own.write_bytes(b"single-author preprint")
+    joint.write_bytes(b"joint paper")
+    title = "Elementary subgroup is perfect.pdf"
+    mine = Placement(Path("Stavrova, Anastasia") / title)
+    ours = Placement(Path("Luzgarev, Alexander Yu") / title, [Path("Stavrova, Anastasia") / title])
+    for _ in range(3):
+        w = RepoWriter(cfg)
+        w.place(own, mine, crc=crc32_file(own))
+        got = w.place(joint, ours, crc=crc32_file(joint))
+        assert got.links == [Path("Stavrova, Anastasia") / "Elementary subgroup is perfect (2).pdf"]
+    assert sorted(p.name for p in (cfg.output_dir / "Stavrova, Anastasia").iterdir()) == [
+        "Elementary subgroup is perfect (2).pdf", title]
+
+
+def test_author_aliases_join_variants_the_merge_cannot(tmp_path):
+    # Another script, a typo and a bare initial: three folders for one man.
+    from paperorg import aliases
+
+    path = tmp_path / "authors.tsv"
+    path.write_text("# one person\nvariant\tcanonical\n"
+                    "Вавилов, Николай\tVavilov, Nikolai\n"
+                    "Vavilov, Nikoli\tVavilov, Nikolai\n"
+                    "Vavilov, N. A.\tVavilov, Nikolai\n"
+                    "N.Vavilov\tVavilov, Nikolai\n", encoding="utf-8")
+    table = aliases.load(path)
+    recs = [BibRecord(title="a", authors=[Author("Вавилов", "Николай")]),
+            BibRecord(title="b", authors=[Author("Vavilov", "N. A."), Author("Plotkin", "Eugene"),
+                                          Author("Vavilov", "Nikoli")]),
+            BibRecord(title="c", authors=[Author(literal="N.Vavilov")])]
+    assert aliases.apply(table, recs) == 4
+    assert [[author_folder(a) for a in r.authors] for r in recs] == [
+        ["Vavilov, Nikolai"], ["Vavilov, Nikolai", "Plotkin, Eugene"], ["Vavilov, Nikolai"]]
+    assert aliases.load(tmp_path / "absent.tsv") == {}
+
+
+def test_overrides_can_leave_a_file_out(tmp_path):
+    from paperorg.pipeline import Organizer
+
+    cfg = Config(input_dir=tmp_path / "in", output_dir=tmp_path / "out",
+                 online=False, interactive=False)
+    leaflet = _item(cfg.input_dir, "Kindergeld_Merkblatt.pdf", b"leaflet")
+    leaflet.record = BibRecord(kind=DocKind.PAPER, title="Kindergeld")
+    cfg.state_dir.mkdir(parents=True)
+    cfg.overrides_path.write_text("file\tkind\nKindergeld_Merkblatt.pdf\tignore\n",
+                                  encoding="utf-8")
+    assert Organizer(cfg).apply_overrides([leaflet]) == 1
+    assert (leaflet.status, leaflet.note) == ("skipped", "ignored in overrides.tsv")
+
+
 def test_overrides_pin_a_record_and_split_a_false_version_group(tmp_path):
     # The corpus case: a Russian thesis matched to the author's paper of a
     # similar title, so the version prompt could only keep one of the two.

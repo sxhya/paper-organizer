@@ -197,9 +197,26 @@ file	kind	doi	title	authors	year	school
 
 A `doi` or `arxiv` is looked up and the other columns win over what it
 returns; a row without either is filed from its own columns. A pinned file is
-never asked about. Because version answers are remembered by the entry they
+never asked about, and `kind` = `ignore` leaves the file out of the repository
+altogether. Because version answers are remembered by the entry they
 were given for, delete the stale `version:` answers from the cache's
 `decision` table when an override changes which files share an entry.
+
+Some spellings of one person are beyond the automatic merge: another script
+(`Вавилов` / `Vavilov`), a romanisation (`Victor` / `Viktor`), a middle name
+used as the first name, a registry typo. `NEW_REPO/.paperorg/authors.tsv` maps
+each such variant, written as its folder name, to the name to use instead:
+
+```
+variant	canonical
+Вавилов, Николай	Vavilov, Nikolai
+Vavilov, N. A	Vavilov, Nikolai
+Hai, Bui Xuan	Bui, Xuan Hai
+```
+
+It applies to every document after the automatic merge, so list only true
+variants of one person; a junk "author" standing for different people in
+different files belongs in `overrides.tsv`.
 
 ## Options
 

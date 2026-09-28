@@ -10,7 +10,7 @@ under what the row says.
 Columns (tab-separated, the header line names them, ``#`` starts a comment):
 
   file      path relative to the input folder (required)
-  kind      paper | book | thesis | other
+  kind      paper | book | thesis | other, or ignore: leave the file out
   doi       fetch the record by DOI (Crossref)
   arxiv     fetch the record by arXiv id
   title, authors, year, journal, volume, number, pages, school, thesis_type,

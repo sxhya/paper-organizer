@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from . import bibtex, overrides
+from . import aliases, bibtex, overrides
 from .cache import Cache, NullCache
 from .classify import classify
 from .config import Config, DJVU_EXTS, PDF_EXTS, PS_EXTS, UNSORTED_DIR
@@ -312,6 +312,10 @@ class Organizer:
             row = rows.pop(str(it.path.relative_to(self.cfg.input_dir)), None)
             if row is None or it.status != "pending":
                 continue
+            if row.get("kind", "").lower() == "ignore":
+                it.status, it.note = "skipped", "ignored in overrides.tsv"
+                applied += 1
+                continue
             fetched = None
             if self.cfg.online and row.get("doi"):
                 fetched = self.resolver.crossref.by_doi(row["doi"])
@@ -424,7 +428,10 @@ class Organizer:
         index.add_records(records)
         index.build()
         index.apply(records)
-        return index.stats()
+        stats = index.stats()
+        # Hand-kept aliases last: they name the folders the merge produced.
+        stats["aliased"] = aliases.apply(aliases.load(self.cfg.aliases_path), records)
+        return stats
 
     # -------------------------------------------------------------- 6. place
     def materialise(self, items: list[Item]) -> list[str]:
@@ -677,6 +684,9 @@ class Organizer:
         if people["merged_variants"]:
             print(f"  {DIM}merged {people['merged_variants']} author name "
                   f"variant(s) into one folder{RESET}")
+        if people["aliased"]:
+            print(f"  {DIM}renamed {people['aliased']} author name(s) from "
+                  f"{cfg.aliases_path.name}{RESET}")
         entries = self.materialise(items)
         # Report on every input file, including the byte-identical copies that
         # were set aside before classification.
